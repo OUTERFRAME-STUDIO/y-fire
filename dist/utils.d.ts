@@ -38,6 +38,6 @@ export declare const refreshPeers: (newPeers: string[], oldPeers: Set<string>) =
 export declare const Uint8ArrayToBase64: (buffer: Uint8Array) => Promise<string>;
 export declare const base64ToUint8Array: (base64: string) => Promise<Uint8Array>;
 export declare const generateKey: (sender: string, receiver: string) => Promise<CryptoKey>;
-export declare const encryptData: (message: any, key: CryptoKey) => Promise<Uint8Array>;
+export declare const encryptData: (message: any, key: CryptoKey) => Promise<any>;
 export declare const decryptData: (message: Uint8Array, key: CryptoKey) => Promise<any>;
 //# sourceMappingURL=utils.d.ts.map

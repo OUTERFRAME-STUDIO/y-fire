@@ -36,8 +36,8 @@
     "simple-peer-light": "^9.10.0"
   },
   "peerDependencies": {
-    "firebase": "^10.7.1",
-    "y-protocols": "^1.0.6",
-    "yjs": "^13.6.12"
+    "firebase": "^12.9.0",
+    "y-protocols": "^1.0.7",
+    "yjs": "^13.6.29"
   }
 }
