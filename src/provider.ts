@@ -215,8 +215,39 @@ export class FireProvider extends ObservableV2<any> {
     if (this.recreateTimeout) clearTimeout(this.recreateTimeout);
     this.recreateTimeout = setTimeout(async () => {
       this.consoleHandler("triggering reconnect", this.uid);
-      this.destroy();
-      this.init();
+      // Soft reconnect: tear down mesh and instance only. Do NOT call destroy() so we keep
+      // doc update handler and trackData — Firestore writes and onSaving keep working when offline.
+      if (this.cacheTimeout) clearTimeout(this.cacheTimeout);
+      if (this.firestoreTimeout) clearTimeout(this.firestoreTimeout);
+      if (this.unsubscribeMesh) {
+        this.unsubscribeMesh();
+        delete this.unsubscribeMesh;
+      }
+      await deleteInstance(this.db, this.documentPath, this.uid);
+      if (this.peersRTC.receivers) {
+        Object.values(this.peersRTC.receivers).forEach((receiver) =>
+          receiver.destroy()
+        );
+        this.peersRTC.receivers = {};
+      }
+      if (this.peersRTC.senders) {
+        Object.values(this.peersRTC.senders).forEach((sender) =>
+          sender.destroy()
+        );
+        this.peersRTC.senders = {};
+      }
+      this.clients = [];
+      this.peersReceivers = new Set([]);
+      this.peersSenders = new Set([]);
+      try {
+        const data = await initiateInstance(this.db, this.documentPath);
+        this.uid = data.uid;
+        this.timeOffset = data.offset;
+        this.trackMesh();
+        // instanceConnection "closed" listener was never removed, no need to re-add
+      } catch (error) {
+        this.consoleHandler("Could not connect to a peer network.");
+      }
     }, 200);
   };
 
