@@ -275,7 +275,7 @@ export class FireProvider extends ObservableV2 {
                 this.consoleHandler("[Firestore save] saveToFirestore: calling setDoc", {
                     documentPath: this.documentPath,
                 });
-                yield setDoc(ref, this.documentMapper(Bytes.fromUint8Array(Y.encodeStateAsUpdate(this.doc))), { merge: true });
+                setDoc(ref, this.documentMapper(Bytes.fromUint8Array(Y.encodeStateAsUpdate(this.doc))), { merge: true });
                 this.consoleHandler("[Firestore save] saveToFirestore: setDoc resolved", null);
                 this.deleteLocal(); // We have successfully saved to Firestore, empty indexedDb for now
                 this.consoleHandler("[Firestore save] saveToFirestore: deleteLocal done", null);
