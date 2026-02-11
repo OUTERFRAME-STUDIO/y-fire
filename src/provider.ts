@@ -159,7 +159,7 @@ export class FireProvider extends ObservableV2<any> {
             this.firebaseDataLastUpdatedAt = now;
             this.consoleHandler(
               "[Firestore save] trackData: firebaseDataLastUpdatedAt set to",
-              { firebaseDataLastUpdatedAt: now }
+              { firebaseDataLastUpdatedAt: now },
             );
             const content = data.content.toUint8Array();
             const origin = "origin:firebase/update"; // make sure this does not coincide with UID
@@ -178,7 +178,7 @@ export class FireProvider extends ObservableV2<any> {
         if (error.code === "permission-denied") {
           if (this.onDeleted) this.onDeleted();
         }
-      }
+      },
     );
   };
 
@@ -196,23 +196,23 @@ export class FireProvider extends ObservableV2<any> {
         // a -> b, c; a is the sender and b, c are receivers
         const receivers: string[] = mesh[this.uid]; // this user's receivers
         const senders: string[] = Object.keys(mesh).filter(
-          (v, i) => mesh[v] && mesh[v].length && mesh[v].includes(this.uid)
+          (v, i) => mesh[v] && mesh[v].length && mesh[v].includes(this.uid),
         ); // this user's senders
 
         this.peersReceivers = this.connectToPeers(
           receivers,
           this.peersReceivers,
-          true
+          true,
         );
         this.peersSenders = this.connectToPeers(
           senders,
           this.peersSenders,
-          false
+          false,
         );
       },
       (error) => {
         this.consoleHandler("Creating peer mesh error", error);
-      }
+      },
     );
   };
 
@@ -231,13 +231,13 @@ export class FireProvider extends ObservableV2<any> {
       await deleteInstance(this.db, this.documentPath, this.uid);
       if (this.peersRTC.receivers) {
         Object.values(this.peersRTC.receivers).forEach((receiver) =>
-          receiver.destroy()
+          receiver.destroy(),
         );
         this.peersRTC.receivers = {};
       }
       if (this.peersRTC.senders) {
         Object.values(this.peersRTC.senders).forEach((sender) =>
-          sender.destroy()
+          sender.destroy(),
         );
         this.peersRTC.senders = {};
       }
@@ -275,7 +275,7 @@ export class FireProvider extends ObservableV2<any> {
   connectToPeers = (
     newPeers: string[],
     oldPeers: Set<string>,
-    isCaller: boolean
+    isCaller: boolean,
   ) => {
     if (!newPeers) return new Set([]);
     // We must:
@@ -352,20 +352,32 @@ export class FireProvider extends ObservableV2<any> {
       this.consoleHandler("[Firestore save] saveToFirestore: calling setDoc", {
         documentPath: this.documentPath,
       });
-      await setDoc(
+      setDoc(
         ref,
         this.documentMapper(
-          Bytes.fromUint8Array(Y.encodeStateAsUpdate(this.doc))
+          Bytes.fromUint8Array(Y.encodeStateAsUpdate(this.doc)),
         ),
-        { merge: true }
+        { merge: true },
       );
-      this.consoleHandler("[Firestore save] saveToFirestore: setDoc resolved", null);
+      this.consoleHandler(
+        "[Firestore save] saveToFirestore: setDoc resolved",
+        null,
+      );
       this.deleteLocal(); // We have successfully saved to Firestore, empty indexedDb for now
-      this.consoleHandler("[Firestore save] saveToFirestore: deleteLocal done", null);
+      this.consoleHandler(
+        "[Firestore save] saveToFirestore: deleteLocal done",
+        null,
+      );
     } catch (error) {
-      this.consoleHandler("[Firestore save] saveToFirestore: CAUGHT error", error);
+      this.consoleHandler(
+        "[Firestore save] saveToFirestore: CAUGHT error",
+        error,
+      );
     } finally {
-      this.consoleHandler("[Firestore save] saveToFirestore: finally, calling onSaving(false)", null);
+      this.consoleHandler(
+        "[Firestore save] saveToFirestore: finally, calling onSaving(false)",
+        null,
+      );
       if (this.onSaving) this.onSaving(false);
     }
   };
@@ -381,9 +393,9 @@ export class FireProvider extends ObservableV2<any> {
     const scheduledAt = new Date().getTime();
     this.firestoreTimeout = setTimeout(() => {
       const now = new Date().getTime();
-      const elapsedSinceLastFirebaseUpdate = now - this.firebaseDataLastUpdatedAt;
-      const shouldSave =
-        elapsedSinceLastFirebaseUpdate > this.maxFirestoreWait;
+      const elapsedSinceLastFirebaseUpdate =
+        now - this.firebaseDataLastUpdatedAt;
+      const shouldSave = elapsedSinceLastFirebaseUpdate > this.maxFirestoreWait;
       this.consoleHandler(
         "[Firestore save] sendToFirestoreQueue: timeout fired",
         {
@@ -393,23 +405,29 @@ export class FireProvider extends ObservableV2<any> {
           maxFirestoreWait: this.maxFirestoreWait,
           shouldSave,
           scheduledAt,
-        }
+        },
       );
       if (shouldSave) {
-        this.consoleHandler("[Firestore save] sendToFirestoreQueue: calling saveToFirestore", null);
+        this.consoleHandler(
+          "[Firestore save] sendToFirestoreQueue: calling saveToFirestore",
+          null,
+        );
         this.saveToFirestore();
       } else {
         this.consoleHandler(
           "[Firestore save] sendToFirestoreQueue: rescheduling (peer recently saved)",
-          null
+          null,
         );
         this.sendToFirestoreQueue();
       }
     }, this.maxFirestoreWait);
-    this.consoleHandler("[Firestore save] sendToFirestoreQueue: scheduled timeout", {
-      delayMs: this.maxFirestoreWait,
-      firebaseDataLastUpdatedAt: this.firebaseDataLastUpdatedAt,
-    });
+    this.consoleHandler(
+      "[Firestore save] sendToFirestoreQueue: scheduled timeout",
+      {
+        delayMs: this.maxFirestoreWait,
+        firebaseDataLastUpdatedAt: this.firebaseDataLastUpdatedAt,
+      },
+    );
   };
 
   sendCache = (from: string) => {
@@ -424,18 +442,24 @@ export class FireProvider extends ObservableV2<any> {
     });
     this.cache = null;
     this.cacheUpdateCount = 0;
-    this.consoleHandler("[Firestore save] sendCache: calling sendToFirestoreQueue", null);
+    this.consoleHandler(
+      "[Firestore save] sendCache: calling sendToFirestoreQueue",
+      null,
+    );
     this.sendToFirestoreQueue();
   };
 
   sendToQueue = ({ from, update }: { from: unknown; update: Uint8Array }) => {
     if (from === this.uid) {
-      this.consoleHandler("[Firestore save] sendToQueue: update from this user (will eventually trigger Firestore save)", {
-        from,
-        thisUid: this.uid,
-        cacheUpdateCount: this.cacheUpdateCount + 1,
-        maxCacheUpdates: this.maxCacheUpdates,
-      });
+      this.consoleHandler(
+        "[Firestore save] sendToQueue: update from this user (will eventually trigger Firestore save)",
+        {
+          from,
+          thisUid: this.uid,
+          cacheUpdateCount: this.cacheUpdateCount + 1,
+          maxCacheUpdates: this.maxCacheUpdates,
+        },
+      );
       if (this.cacheTimeout) clearTimeout(this.cacheTimeout);
 
       this.cache = this.cache ? Y.mergeUpdates([this.cache, update]) : update;
@@ -496,7 +520,7 @@ export class FireProvider extends ObservableV2<any> {
       updated,
       removed,
     }: { added: number[]; updated: number[]; removed: number[] },
-    origin: unknown
+    origin: unknown,
   ) => {
     const changedClients = added.concat(updated).concat(removed);
     this.sendDataToPeers({
@@ -504,7 +528,7 @@ export class FireProvider extends ObservableV2<any> {
       message: "awareness",
       data: awarenessProtocol.encodeAwarenessUpdate(
         this.awareness,
-        changedClients
+        changedClients,
       ),
     });
   };
@@ -515,7 +539,7 @@ export class FireProvider extends ObservableV2<any> {
       this.documentPath,
       `this client: ${this.uid}`,
       message,
-      data
+      data,
     );
   };
 
@@ -548,12 +572,12 @@ export class FireProvider extends ObservableV2<any> {
     if (this.peersRTC) {
       if (this.peersRTC.receivers) {
         Object.values(this.peersRTC.receivers).forEach((receiver) =>
-          receiver.destroy()
+          receiver.destroy(),
         );
       }
       if (this.peersRTC.senders) {
         Object.values(this.peersRTC.senders).forEach((sender) =>
-          sender.destroy()
+          sender.destroy(),
         );
       }
     }
