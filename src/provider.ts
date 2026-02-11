@@ -102,7 +102,10 @@ export class FireProvider extends ObservableV2<any> {
       addEventListener("beforeunload", this.destroy); // destroy instance on window close
     } catch (error) {
       this.consoleHandler("Could not connect to a peer network.");
-      this.kill(true); // destroy provider but keep the read-only stream alive
+      // Keep read-only stream (trackData) and re-attach the doc update handler
+      // so we still write to Firestore (e.g. queued when offline with persistence).
+      // this.uid stays from previous session; we're not in the mesh until back online.
+      this.initiateHandler();
     }
   };
 

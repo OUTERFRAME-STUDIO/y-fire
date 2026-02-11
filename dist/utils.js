@@ -7,7 +7,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
         step((generator = generator.apply(thisArg, _arguments || [])).next());
     });
 };
-import { doc, getDoc, serverTimestamp, setDoc, getDocs, collection, runTransaction, } from "@firebase/firestore";
+import { doc, getDoc, serverTimestamp, setDoc, getDocs, collection, writeBatch, } from "@firebase/firestore";
 import * as encoding from "lib0/encoding";
 import * as decoding from "lib0/decoding";
 import * as string from "lib0/string";
@@ -66,31 +66,32 @@ export const initiateInstance = (db, path) => __awaiter(void 0, void 0, void 0, 
  * @param uid
  */
 export const deleteInstance = (db, path, uid) => __awaiter(void 0, void 0, void 0, function* () {
-    // console.log("Destroy instance", path, uid);
     try {
         if (!uid)
             throw `instance id is empty`;
-        yield runTransaction(db, (transaction) => __awaiter(void 0, void 0, void 0, function* () {
-            const ref = doc(db, `${path}/instances`, uid);
-            const callsRef = collection(db, `${path}/instances/${uid}/calls`);
-            const answersRef = collection(db, `${path}/instances/${uid}/answers`);
-            const calls = yield getDocs(callsRef);
-            const answers = yield getDocs(answersRef);
-            calls.forEach((call) => {
-                const callRef = doc(db, `${path}/instances/${uid}/calls/${call.id}`);
-                transaction.delete(callRef);
-            });
-            answers.forEach((answer) => {
-                const answerRef = doc(db, `${path}/instances/${uid}/answers/${answer.id}`);
-                transaction.delete(answerRef);
-            });
-            transaction.delete(ref);
-        }));
-        // return { success: true };
+        // 1. Create a Batch
+        const batch = writeBatch(db);
+        const ref = doc(db, `${path}/instances`, uid);
+        const callsRef = collection(db, `${path}/instances/${uid}/calls`);
+        const answersRef = collection(db, `${path}/instances/${uid}/answers`);
+        // NOTE: The 'getDocs' here might still fail or return cached data if offline.
+        // However, the subsequent deletes will be queued successfully.
+        const calls = yield getDocs(callsRef);
+        const answers = yield getDocs(answersRef);
+        calls.forEach((call) => {
+            const callRef = doc(db, `${path}/instances/${uid}/calls/${call.id}`);
+            batch.delete(callRef); // Add to batch
+        });
+        answers.forEach((answer) => {
+            const answerRef = doc(db, `${path}/instances/${uid}/answers/${answer.id}`);
+            batch.delete(answerRef); // Add to batch
+        });
+        batch.delete(ref); // Add instance delete to batch
+        // 2. Commit the Batch (This works offline! It queues the operations)
+        yield batch.commit();
     }
     catch (error) {
-        // console.log(path, "Delete instance error:", error);
-        // return { success: false, error };
+        // Handle error
     }
 });
 /**

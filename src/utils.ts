@@ -7,7 +7,7 @@ import {
   collection,
   Firestore,
   Timestamp,
-  runTransaction,
+  writeBatch,
 } from "@firebase/firestore";
 
 import * as encoding from "lib0/encoding";
@@ -75,35 +75,42 @@ export const initiateInstance = async (db: Firestore, path: string) => {
 export const deleteInstance = async (
   db: Firestore,
   path: string,
-  uid: string
+  uid: string,
 ) => {
-  // console.log("Destroy instance", path, uid);
   try {
     if (!uid) throw `instance id is empty`;
-    await runTransaction(db, async (transaction) => {
-      const ref = doc(db, `${path}/instances`, uid);
-      const callsRef = collection(db, `${path}/instances/${uid}/calls`);
-      const answersRef = collection(db, `${path}/instances/${uid}/answers`);
-      const calls = await getDocs(callsRef);
-      const answers = await getDocs(answersRef);
 
-      calls.forEach((call) => {
-        const callRef = doc(db, `${path}/instances/${uid}/calls/${call.id}`);
-        transaction.delete(callRef);
-      });
-      answers.forEach((answer) => {
-        const answerRef = doc(
-          db,
-          `${path}/instances/${uid}/answers/${answer.id}`
-        );
-        transaction.delete(answerRef);
-      });
-      transaction.delete(ref);
+    // 1. Create a Batch
+    const batch = writeBatch(db);
+
+    const ref = doc(db, `${path}/instances`, uid);
+    const callsRef = collection(db, `${path}/instances/${uid}/calls`);
+    const answersRef = collection(db, `${path}/instances/${uid}/answers`);
+
+    // NOTE: The 'getDocs' here might still fail or return cached data if offline.
+    // However, the subsequent deletes will be queued successfully.
+    const calls = await getDocs(callsRef);
+    const answers = await getDocs(answersRef);
+
+    calls.forEach((call) => {
+      const callRef = doc(db, `${path}/instances/${uid}/calls/${call.id}`);
+      batch.delete(callRef); // Add to batch
     });
-    // return { success: true };
+
+    answers.forEach((answer) => {
+      const answerRef = doc(
+        db,
+        `${path}/instances/${uid}/answers/${answer.id}`,
+      );
+      batch.delete(answerRef); // Add to batch
+    });
+
+    batch.delete(ref); // Add instance delete to batch
+
+    // 2. Commit the Batch (This works offline! It queues the operations)
+    await batch.commit();
   } catch (error) {
-    // console.log(path, "Delete instance error:", error);
-    // return { success: false, error };
+    // Handle error
   }
 };
 
@@ -117,7 +124,7 @@ export const killZombie = async (
   db: Firestore,
   path: string,
   uid: string,
-  peerUid: string
+  peerUid: string,
 ) => {
   try {
     const ref = doc(db, `${path}/instances`, uid);
@@ -142,7 +149,7 @@ export const killZombie = async (
 
 export const refreshPeers = (newPeers: string[], oldPeers: Set<string>) => {
   const oldMinusNew = Array.from(oldPeers).filter(
-    (item) => !newPeers.includes(item)
+    (item) => !newPeers.includes(item),
   );
   const noChange = Array.from(oldPeers).filter((x) => newPeers.includes(x));
   const newMinusOld = newPeers.filter((item) => !oldPeers.has(item));
@@ -193,8 +200,8 @@ export const generateKey = async (sender: string, receiver: string) => {
           length: 256,
         },
         true,
-        ["encrypt", "decrypt"]
-      )
+        ["encrypt", "decrypt"],
+      ),
     );
   return key;
 };
@@ -213,7 +220,7 @@ export const encryptData = async (message: any, key: CryptoKey) => {
         iv: iv,
       },
       key,
-      data
+      data,
     );
 
     const encryptedDataEncoder = encoding.createEncoder();
@@ -239,7 +246,7 @@ export const decryptData = async (message: Uint8Array, key: CryptoKey) => {
         iv,
       },
       key,
-      cipher
+      cipher,
     );
     // console.log("Decrypted", decrypted);
     const decoder = new TextDecoder();

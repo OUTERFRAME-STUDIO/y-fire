@@ -60,7 +60,10 @@ export class FireProvider extends ObservableV2 {
             }
             catch (error) {
                 this.consoleHandler("Could not connect to a peer network.");
-                this.kill(true); // destroy provider but keep the read-only stream alive
+                // Keep read-only stream (trackData) and re-attach the doc update handler
+                // so we still write to Firestore (e.g. queued when offline with persistence).
+                // this.uid stays from previous session; we're not in the mesh until back online.
+                this.initiateHandler();
             }
         });
         this.syncLocal = () => __awaiter(this, void 0, void 0, function* () {
