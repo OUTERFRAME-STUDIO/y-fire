@@ -93,19 +93,18 @@ export class FireProvider extends ObservableV2<any> {
 
   init = async () => {
     this.trackData(); // initiate this before creating instance, so that users with read permissions can also view the document
+    // Attach update handler immediately so writes (and onSaving) work even when
+    // initiateInstance() fails or hangs offline. this.uid stays from previous session until we get a new one.
+    this.initiateHandler();
     try {
       const data = await initiateInstance(this.db, this.documentPath);
       this.instanceConnection.on("closed", this.trackConnections);
       this.uid = data.uid;
       this.timeOffset = data.offset;
-      this.initiateHandler();
       addEventListener("beforeunload", this.destroy); // destroy instance on window close
     } catch (error) {
       this.consoleHandler("Could not connect to a peer network.");
-      // Keep read-only stream (trackData) and re-attach the doc update handler
-      // so we still write to Firestore (e.g. queued when offline with persistence).
-      // this.uid stays from previous session; we're not in the mesh until back online.
-      this.initiateHandler();
+      // this.uid stays from previous session; update handler already attached above
     }
   };
 
