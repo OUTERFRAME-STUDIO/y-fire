@@ -50,20 +50,19 @@ export class FireProvider extends ObservableV2 {
         this.ready = false;
         this.init = () => __awaiter(this, void 0, void 0, function* () {
             this.trackData(); // initiate this before creating instance, so that users with read permissions can also view the document
+            // Attach update handler immediately so writes (and onSaving) work even when
+            // initiateInstance() fails or hangs offline. this.uid stays from previous session until we get a new one.
+            this.initiateHandler();
             try {
                 const data = yield initiateInstance(this.db, this.documentPath);
                 this.instanceConnection.on("closed", this.trackConnections);
                 this.uid = data.uid;
                 this.timeOffset = data.offset;
-                this.initiateHandler();
                 addEventListener("beforeunload", this.destroy); // destroy instance on window close
             }
             catch (error) {
                 this.consoleHandler("Could not connect to a peer network.");
-                // Keep read-only stream (trackData) and re-attach the doc update handler
-                // so we still write to Firestore (e.g. queued when offline with persistence).
-                // this.uid stays from previous session; we're not in the mesh until back online.
-                this.initiateHandler();
+                // this.uid stays from previous session; update handler already attached above
             }
         });
         this.syncLocal = () => __awaiter(this, void 0, void 0, function* () {
@@ -112,7 +111,9 @@ export class FireProvider extends ObservableV2 {
                 if (doc.exists()) {
                     const data = doc.data();
                     if (data && data.content) {
-                        this.firebaseDataLastUpdatedAt = new Date().getTime();
+                        const now = new Date().getTime();
+                        this.firebaseDataLastUpdatedAt = now;
+                        this.consoleHandler("[Firestore save] trackData: firebaseDataLastUpdatedAt set to", { firebaseDataLastUpdatedAt: now });
                         const content = data.content.toUint8Array();
                         const origin = "origin:firebase/update"; // make sure this does not coincide with UID
                         Y.applyUpdate(this.doc, content, origin);
@@ -155,8 +156,38 @@ export class FireProvider extends ObservableV2 {
                 clearTimeout(this.recreateTimeout);
             this.recreateTimeout = setTimeout(() => __awaiter(this, void 0, void 0, function* () {
                 this.consoleHandler("triggering reconnect", this.uid);
-                this.destroy();
-                this.init();
+                // Soft reconnect: tear down mesh and instance only. Do NOT call destroy() so we keep
+                // doc update handler and trackData — Firestore writes and onSaving keep working when offline.
+                if (this.cacheTimeout)
+                    clearTimeout(this.cacheTimeout);
+                if (this.firestoreTimeout)
+                    clearTimeout(this.firestoreTimeout);
+                if (this.unsubscribeMesh) {
+                    this.unsubscribeMesh();
+                    delete this.unsubscribeMesh;
+                }
+                yield deleteInstance(this.db, this.documentPath, this.uid);
+                if (this.peersRTC.receivers) {
+                    Object.values(this.peersRTC.receivers).forEach((receiver) => receiver.destroy());
+                    this.peersRTC.receivers = {};
+                }
+                if (this.peersRTC.senders) {
+                    Object.values(this.peersRTC.senders).forEach((sender) => sender.destroy());
+                    this.peersRTC.senders = {};
+                }
+                this.clients = [];
+                this.peersReceivers = new Set([]);
+                this.peersSenders = new Set([]);
+                try {
+                    const data = yield initiateInstance(this.db, this.documentPath);
+                    this.uid = data.uid;
+                    this.timeOffset = data.offset;
+                    this.trackMesh();
+                    // instanceConnection "closed" listener was never removed, no need to re-add
+                }
+                catch (error) {
+                    this.consoleHandler("Could not connect to a peer network.");
+                }
             }), 200);
         };
         this.trackConnections = () => __awaiter(this, void 0, void 0, function* () {
@@ -238,38 +269,68 @@ export class FireProvider extends ObservableV2 {
             }
         };
         this.saveToFirestore = () => __awaiter(this, void 0, void 0, function* () {
+            this.consoleHandler("[Firestore save] saveToFirestore: ENTRY", null);
             try {
-                // current document to firestore
                 const ref = doc(this.db, this.documentPath);
+                this.consoleHandler("[Firestore save] saveToFirestore: calling setDoc", {
+                    documentPath: this.documentPath,
+                });
                 yield setDoc(ref, this.documentMapper(Bytes.fromUint8Array(Y.encodeStateAsUpdate(this.doc))), { merge: true });
+                this.consoleHandler("[Firestore save] saveToFirestore: setDoc resolved", null);
                 this.deleteLocal(); // We have successfully saved to Firestore, empty indexedDb for now
+                this.consoleHandler("[Firestore save] saveToFirestore: deleteLocal done", null);
             }
             catch (error) {
-                this.consoleHandler("error saving to firestore", error);
+                this.consoleHandler("[Firestore save] saveToFirestore: CAUGHT error", error);
             }
             finally {
+                this.consoleHandler("[Firestore save] saveToFirestore: finally, calling onSaving(false)", null);
                 if (this.onSaving)
                     this.onSaving(false);
             }
         });
         this.sendToFirestoreQueue = () => {
-            // if cache settles down, save document to firebase
+            this.consoleHandler("[Firestore save] sendToFirestoreQueue: ENTRY", {
+                firebaseDataLastUpdatedAt: this.firebaseDataLastUpdatedAt,
+                maxFirestoreWait: this.maxFirestoreWait,
+                hadExistingTimeout: !!this.firestoreTimeout,
+            });
             if (this.firestoreTimeout)
-                clearTimeout(this.firestoreTimeout); // kill other save processes first
+                clearTimeout(this.firestoreTimeout);
             if (this.onSaving)
                 this.onSaving(true);
+            const scheduledAt = new Date().getTime();
             this.firestoreTimeout = setTimeout(() => {
-                if (new Date().getTime() - this.firebaseDataLastUpdatedAt >
-                    this.maxFirestoreWait) {
+                const now = new Date().getTime();
+                const elapsedSinceLastFirebaseUpdate = now - this.firebaseDataLastUpdatedAt;
+                const shouldSave = elapsedSinceLastFirebaseUpdate > this.maxFirestoreWait;
+                this.consoleHandler("[Firestore save] sendToFirestoreQueue: timeout fired", {
+                    now,
+                    firebaseDataLastUpdatedAt: this.firebaseDataLastUpdatedAt,
+                    elapsedSinceLastFirebaseUpdate,
+                    maxFirestoreWait: this.maxFirestoreWait,
+                    shouldSave,
+                    scheduledAt,
+                });
+                if (shouldSave) {
+                    this.consoleHandler("[Firestore save] sendToFirestoreQueue: calling saveToFirestore", null);
                     this.saveToFirestore();
                 }
                 else {
-                    // A peer recently saved to firebase, let's wait a bit
+                    this.consoleHandler("[Firestore save] sendToFirestoreQueue: rescheduling (peer recently saved)", null);
                     this.sendToFirestoreQueue();
                 }
             }, this.maxFirestoreWait);
+            this.consoleHandler("[Firestore save] sendToFirestoreQueue: scheduled timeout", {
+                delayMs: this.maxFirestoreWait,
+                firebaseDataLastUpdatedAt: this.firebaseDataLastUpdatedAt,
+            });
         };
         this.sendCache = (from) => {
+            this.consoleHandler("[Firestore save] sendCache: ENTRY", {
+                from,
+                cacheUpdateCount: this.cacheUpdateCount,
+            });
             this.sendDataToPeers({
                 from,
                 message: null,
@@ -277,11 +338,17 @@ export class FireProvider extends ObservableV2 {
             });
             this.cache = null;
             this.cacheUpdateCount = 0;
-            this.sendToFirestoreQueue(); // save to firestore
+            this.consoleHandler("[Firestore save] sendCache: calling sendToFirestoreQueue", null);
+            this.sendToFirestoreQueue();
         };
         this.sendToQueue = ({ from, update }) => {
             if (from === this.uid) {
-                // this update was from this user
+                this.consoleHandler("[Firestore save] sendToQueue: update from this user (will eventually trigger Firestore save)", {
+                    from,
+                    thisUid: this.uid,
+                    cacheUpdateCount: this.cacheUpdateCount + 1,
+                    maxCacheUpdates: this.maxCacheUpdates,
+                });
                 if (this.cacheTimeout)
                     clearTimeout(this.cacheTimeout);
                 this.cache = this.cache ? Y.mergeUpdates([this.cache, update]) : update;
