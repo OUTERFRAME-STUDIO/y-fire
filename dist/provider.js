@@ -113,7 +113,6 @@ export class FireProvider extends ObservableV2 {
                     if (data && data.content) {
                         const now = new Date().getTime();
                         this.firebaseDataLastUpdatedAt = now;
-                        this.consoleHandler("[Firestore save] trackData: firebaseDataLastUpdatedAt set to", { firebaseDataLastUpdatedAt: now });
                         const content = data.content.toUint8Array();
                         const origin = "origin:firebase/update"; // make sure this does not coincide with UID
                         Y.applyUpdate(this.doc, content, origin);
@@ -269,32 +268,20 @@ export class FireProvider extends ObservableV2 {
             }
         };
         this.saveToFirestore = () => __awaiter(this, void 0, void 0, function* () {
-            this.consoleHandler("[Firestore save] saveToFirestore: ENTRY", null);
             try {
                 const ref = doc(this.db, this.documentPath);
-                this.consoleHandler("[Firestore save] saveToFirestore: calling setDoc", {
-                    documentPath: this.documentPath,
-                });
                 setDoc(ref, this.documentMapper(Bytes.fromUint8Array(Y.encodeStateAsUpdate(this.doc))), { merge: true });
-                this.consoleHandler("[Firestore save] saveToFirestore: setDoc resolved", null);
                 this.deleteLocal(); // We have successfully saved to Firestore, empty indexedDb for now
-                this.consoleHandler("[Firestore save] saveToFirestore: deleteLocal done", null);
             }
             catch (error) {
-                this.consoleHandler("[Firestore save] saveToFirestore: CAUGHT error", error);
+                this.consoleHandler("saveToFirestore: CAUGHT error", error);
             }
             finally {
-                this.consoleHandler("[Firestore save] saveToFirestore: finally, calling onSaving(false)", null);
                 if (this.onSaving)
                     this.onSaving(false);
             }
         });
         this.sendToFirestoreQueue = () => {
-            this.consoleHandler("[Firestore save] sendToFirestoreQueue: ENTRY", {
-                firebaseDataLastUpdatedAt: this.firebaseDataLastUpdatedAt,
-                maxFirestoreWait: this.maxFirestoreWait,
-                hadExistingTimeout: !!this.firestoreTimeout,
-            });
             if (this.firestoreTimeout)
                 clearTimeout(this.firestoreTimeout);
             if (this.onSaving)
@@ -304,33 +291,15 @@ export class FireProvider extends ObservableV2 {
                 const now = new Date().getTime();
                 const elapsedSinceLastFirebaseUpdate = now - this.firebaseDataLastUpdatedAt;
                 const shouldSave = elapsedSinceLastFirebaseUpdate > this.maxFirestoreWait;
-                this.consoleHandler("[Firestore save] sendToFirestoreQueue: timeout fired", {
-                    now,
-                    firebaseDataLastUpdatedAt: this.firebaseDataLastUpdatedAt,
-                    elapsedSinceLastFirebaseUpdate,
-                    maxFirestoreWait: this.maxFirestoreWait,
-                    shouldSave,
-                    scheduledAt,
-                });
                 if (shouldSave) {
-                    this.consoleHandler("[Firestore save] sendToFirestoreQueue: calling saveToFirestore", null);
                     this.saveToFirestore();
                 }
                 else {
-                    this.consoleHandler("[Firestore save] sendToFirestoreQueue: rescheduling (peer recently saved)", null);
                     this.sendToFirestoreQueue();
                 }
             }, this.maxFirestoreWait);
-            this.consoleHandler("[Firestore save] sendToFirestoreQueue: scheduled timeout", {
-                delayMs: this.maxFirestoreWait,
-                firebaseDataLastUpdatedAt: this.firebaseDataLastUpdatedAt,
-            });
         };
         this.sendCache = (from) => {
-            this.consoleHandler("[Firestore save] sendCache: ENTRY", {
-                from,
-                cacheUpdateCount: this.cacheUpdateCount,
-            });
             this.sendDataToPeers({
                 from,
                 message: null,
@@ -338,17 +307,10 @@ export class FireProvider extends ObservableV2 {
             });
             this.cache = null;
             this.cacheUpdateCount = 0;
-            this.consoleHandler("[Firestore save] sendCache: calling sendToFirestoreQueue", null);
             this.sendToFirestoreQueue();
         };
         this.sendToQueue = ({ from, update }) => {
             if (from === this.uid) {
-                this.consoleHandler("[Firestore save] sendToQueue: update from this user (will eventually trigger Firestore save)", {
-                    from,
-                    thisUid: this.uid,
-                    cacheUpdateCount: this.cacheUpdateCount + 1,
-                    maxCacheUpdates: this.maxCacheUpdates,
-                });
                 if (this.cacheTimeout)
                     clearTimeout(this.cacheTimeout);
                 this.cache = this.cache ? Y.mergeUpdates([this.cache, update]) : update;
