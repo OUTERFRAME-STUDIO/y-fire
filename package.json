@@ -1,6 +1,6 @@
 {
   "name": "y-fire",
-  "version": "2.1.9",
+  "version": "2.1.11",
   "description": "A firebase (firestore) provider for Yjs",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
