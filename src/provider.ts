@@ -12,10 +12,14 @@ import { collection } from "firebase/firestore";
 import * as Y from "yjs";
 import { ObservableV2 } from "lib0/observable";
 import * as awarenessProtocol from "y-protocols/awareness";
-import { get as getLocal, set as setLocal, del as delLocal } from "idb-keyval";
 import { deleteInstance, initiateInstance, refreshPeers } from "./utils";
 import { WebRtc } from "./webrtc";
 import { createGraph } from "./graph";
+import {
+  createPersistenceAdapter,
+  PersistenceAdapter,
+  PersistenceMode,
+} from "./persistence";
 
 export interface Parameters {
   firebaseApp: FirebaseApp;
@@ -25,6 +29,8 @@ export interface Parameters {
   maxUpdatesThreshold?: number;
   maxWaitTime?: number;
   maxWaitFirestoreTime?: number;
+  maxFirestoreDeferral?: number;
+  persistence?: PersistenceMode;
 }
 
 interface PeersRTC {
@@ -35,6 +41,9 @@ interface PeersRTC {
     [key: string]: WebRtc;
   };
 }
+
+const SNAPSHOT_BACKOFF_BASE_MS = 500;
+const SNAPSHOT_BACKOFF_MAX_MS = 16_000;
 
 /**
  * FireProvider class that handles firestore data sync and awareness
@@ -73,6 +82,8 @@ export class FireProvider extends ObservableV2<any> {
   maxRTCWait: number = 100;
   firestoreTimeout: string | number | NodeJS.Timeout;
   maxFirestoreWait: number = 3000;
+  maxFirestoreDeferral: number = 10_000;
+  scheduledFirstAt?: number;
 
   firebaseDataLastUpdatedAt: number = new Date().getTime();
 
@@ -81,6 +92,13 @@ export class FireProvider extends ObservableV2<any> {
 
   private unsubscribeData?: Unsubscribe;
   private unsubscribeMesh?: Unsubscribe;
+  private persistenceAdapter: PersistenceAdapter;
+  private persistenceMode: PersistenceMode;
+  private snapshotRetryAttempt: number = 0;
+  private meshRetryAttempt: number = 0;
+  private snapshotRetryTimeout?: ReturnType<typeof setTimeout>;
+  private meshRetryTimeout?: ReturnType<typeof setTimeout>;
+  private dataListenerPaused: boolean = false;
 
   get clientTimeOffset() {
     return this.timeOffset;
@@ -101,7 +119,10 @@ export class FireProvider extends ObservableV2<any> {
       this.instanceConnection.on("closed", this.trackConnections);
       this.uid = data.uid;
       this.timeOffset = data.offset;
-      addEventListener("beforeunload", this.destroy); // destroy instance on window close
+      addEventListener("beforeunload", this.destroy);
+      addEventListener("pagehide", this.destroy);
+      addEventListener("visibilitychange", this.onVisibilityChange);
+      addEventListener("pageshow", this.onPageShow);
     } catch (error) {
       this.consoleHandler("Could not connect to a peer network.");
       // this.uid stays from previous session; update handler already attached above
@@ -110,8 +131,13 @@ export class FireProvider extends ObservableV2<any> {
 
   syncLocal = async () => {
     try {
-      const local = await getLocal(this.documentPath);
-      if (local) Y.applyUpdate(this.doc, local, { key: "local-sync" });
+      const local = await this.persistenceAdapter.getLocal(this.documentPath);
+      if (local) {
+        Y.applyUpdate(this.doc, local, { key: "local-sync" });
+        if (this.persistenceMode !== "none") {
+          this.sendToFirestoreQueue();
+        }
+      }
     } catch (e) {
       this.consoleHandler("get local error", e);
     }
@@ -120,7 +146,7 @@ export class FireProvider extends ObservableV2<any> {
   saveToLocal = async () => {
     try {
       const currentDoc = Y.encodeStateAsUpdate(this.doc);
-      setLocal(this.documentPath, currentDoc);
+      await this.persistenceAdapter.setLocal(this.documentPath, currentDoc);
     } catch (e) {
       this.consoleHandler("set local error", e);
     }
@@ -128,7 +154,7 @@ export class FireProvider extends ObservableV2<any> {
 
   deleteLocal = async () => {
     try {
-      delLocal(this.documentPath);
+      await this.persistenceAdapter.deleteLocal(this.documentPath);
     } catch (e) {
       this.consoleHandler("del local error", e);
     }
@@ -144,14 +170,52 @@ export class FireProvider extends ObservableV2<any> {
     this.syncLocal(); // if there's any data in indexedDb, get and apply
   };
 
+  private scheduleSnapshotRetry = () => {
+    const delay = Math.min(
+      SNAPSHOT_BACKOFF_BASE_MS * Math.pow(2, this.snapshotRetryAttempt),
+      SNAPSHOT_BACKOFF_MAX_MS,
+    );
+    this.snapshotRetryAttempt++;
+    this.consoleHandler(
+      "Scheduling trackData retry",
+      `attempt ${this.snapshotRetryAttempt}, delay ${delay}ms`,
+    );
+    if (this.snapshotRetryTimeout) clearTimeout(this.snapshotRetryTimeout);
+    this.snapshotRetryTimeout = setTimeout(() => {
+      this.trackData();
+    }, delay);
+  };
+
+  private scheduleMeshRetry = () => {
+    const delay = Math.min(
+      SNAPSHOT_BACKOFF_BASE_MS * Math.pow(2, this.meshRetryAttempt),
+      SNAPSHOT_BACKOFF_MAX_MS,
+    );
+    this.meshRetryAttempt++;
+    this.consoleHandler(
+      "Scheduling trackMesh retry",
+      `attempt ${this.meshRetryAttempt}, delay ${delay}ms`,
+    );
+    if (this.meshRetryTimeout) clearTimeout(this.meshRetryTimeout);
+    this.meshRetryTimeout = setTimeout(() => {
+      this.trackMesh();
+    }, delay);
+  };
+
   trackData = () => {
     // Whenever there are changes to the firebase document
     // pull the changes and merge them to the current
     // yjs document
     if (this.unsubscribeData) this.unsubscribeData();
+    if (this.snapshotRetryTimeout) {
+      clearTimeout(this.snapshotRetryTimeout);
+      delete this.snapshotRetryTimeout;
+    }
+    this.dataListenerPaused = false;
     this.unsubscribeData = onSnapshot(
       doc(this.db, this.documentPath),
       (doc) => {
+        this.snapshotRetryAttempt = 0;
         if (doc.exists()) {
           const data = doc.data();
           if (data && data.content) {
@@ -173,16 +237,23 @@ export class FireProvider extends ObservableV2<any> {
         this.consoleHandler("Firestore sync error", error);
         if (error.code === "permission-denied") {
           if (this.onDeleted) this.onDeleted();
+          return;
         }
+        this.scheduleSnapshotRetry();
       },
     );
   };
 
   trackMesh = () => {
     if (this.unsubscribeMesh) this.unsubscribeMesh();
+    if (this.meshRetryTimeout) {
+      clearTimeout(this.meshRetryTimeout);
+      delete this.meshRetryTimeout;
+    }
     this.unsubscribeMesh = onSnapshot(
       collection(this.db, `${this.documentPath}/instances`),
       (snapshot) => {
+        this.meshRetryAttempt = 0;
         this.clients = [];
         snapshot.forEach((doc) => {
           this.clients.push(doc.id);
@@ -208,6 +279,11 @@ export class FireProvider extends ObservableV2<any> {
       },
       (error) => {
         this.consoleHandler("Creating peer mesh error", error);
+        if (error.code === "permission-denied") {
+          if (this.onDeleted) this.onDeleted();
+          return;
+        }
+        this.scheduleMeshRetry();
       },
     );
   };
@@ -344,14 +420,15 @@ export class FireProvider extends ObservableV2<any> {
   saveToFirestore = async () => {
     try {
       const ref = doc(this.db, this.documentPath);
-      setDoc(
+      await setDoc(
         ref,
         this.documentMapper(
           Bytes.fromUint8Array(Y.encodeStateAsUpdate(this.doc)),
         ),
         { merge: true },
       );
-      this.deleteLocal(); // We have successfully saved to Firestore, empty indexedDb for now
+      this.scheduledFirstAt = undefined;
+      await this.deleteLocal();
     } catch (error) {
       this.consoleHandler("saveToFirestore: CAUGHT error", error);
     } finally {
@@ -362,12 +439,17 @@ export class FireProvider extends ObservableV2<any> {
   sendToFirestoreQueue = () => {
     if (this.firestoreTimeout) clearTimeout(this.firestoreTimeout);
     if (this.onSaving) this.onSaving(true);
-    const scheduledAt = new Date().getTime();
+    if (this.scheduledFirstAt === undefined) {
+      this.scheduledFirstAt = Date.now();
+    }
     this.firestoreTimeout = setTimeout(() => {
-      const now = new Date().getTime();
+      const now = Date.now();
       const elapsedSinceLastFirebaseUpdate =
         now - this.firebaseDataLastUpdatedAt;
-      const shouldSave = elapsedSinceLastFirebaseUpdate > this.maxFirestoreWait;
+      const elapsedSinceScheduled = now - (this.scheduledFirstAt ?? now);
+      const shouldSave =
+        elapsedSinceLastFirebaseUpdate > this.maxFirestoreWait ||
+        elapsedSinceScheduled > this.maxFirestoreDeferral;
       if (shouldSave) {
         this.saveToFirestore();
       } else {
@@ -462,6 +544,29 @@ export class FireProvider extends ObservableV2<any> {
     });
   };
 
+  flushOnHide = () => {
+    if (this.firestoreTimeout || this.cache) {
+      void this.saveToFirestore();
+    }
+    if (this.unsubscribeData) {
+      this.unsubscribeData();
+      delete this.unsubscribeData;
+      this.dataListenerPaused = true;
+    }
+  };
+
+  onVisibilityChange = () => {
+    if (document.visibilityState === "hidden") {
+      this.flushOnHide();
+    }
+  };
+
+  onPageShow = () => {
+    if (this.dataListenerPaused) {
+      this.trackData();
+    }
+  };
+
   consoleHandler = (message: any, data: any = null) => {
     console.log(
       "Provider:",
@@ -478,15 +583,27 @@ export class FireProvider extends ObservableV2<any> {
     // we have to create a separate function here
     // because beforeunload only takes this.destroy
     // and not this.destroy() or with this.destroy(args)
-    this.kill();
+    void this.kill();
   };
 
-  kill = (keepReadOnly: boolean = false) => {
+  kill = async (keepReadOnly: boolean = false) => {
+    if (this.firestoreTimeout || this.cache) {
+      try {
+        await this.saveToFirestore();
+      } catch (error) {
+        this.consoleHandler("kill: flush error", error);
+      }
+    }
     this.instanceConnection.destroy();
     removeEventListener("beforeunload", this.destroy);
+    removeEventListener("pagehide", this.destroy);
+    removeEventListener("visibilitychange", this.onVisibilityChange);
+    removeEventListener("pageshow", this.onPageShow);
     if (this.recreateTimeout) clearTimeout(this.recreateTimeout);
     if (this.cacheTimeout) clearTimeout(this.cacheTimeout);
     if (this.firestoreTimeout) clearTimeout(this.firestoreTimeout);
+    if (this.snapshotRetryTimeout) clearTimeout(this.snapshotRetryTimeout);
+    if (this.meshRetryTimeout) clearTimeout(this.meshRetryTimeout);
     this.doc.off("update", this.updateHandler);
     this.awareness.off("update", this.awarenessUpdateHandler);
     deleteInstance(this.db, this.documentPath, this.uid);
@@ -522,6 +639,8 @@ export class FireProvider extends ObservableV2<any> {
     maxUpdatesThreshold,
     maxWaitTime,
     maxWaitFirestoreTime,
+    maxFirestoreDeferral,
+    persistence,
   }: Parameters) {
     super();
 
@@ -534,6 +653,9 @@ export class FireProvider extends ObservableV2<any> {
     if (maxUpdatesThreshold) this.maxCacheUpdates = maxUpdatesThreshold;
     if (maxWaitTime) this.maxRTCWait = maxWaitTime;
     if (maxWaitFirestoreTime) this.maxFirestoreWait = maxWaitFirestoreTime;
+    if (maxFirestoreDeferral) this.maxFirestoreDeferral = maxFirestoreDeferral;
+    this.persistenceMode = persistence ?? "indexeddb";
+    this.persistenceAdapter = createPersistenceAdapter(this.persistenceMode);
     this.awareness = new awarenessProtocol.Awareness(this.doc);
 
     // Initialize the provider
