@@ -586,7 +586,7 @@ export class FireProvider extends ObservableV2<any> {
     void this.kill();
   };
 
-  kill = async (keepReadOnly: boolean = false) => {
+  async kill(keepReadOnly: boolean = false) {
     if (this.firestoreTimeout || this.cache) {
       try {
         await this.saveToFirestore();
@@ -629,7 +629,7 @@ export class FireProvider extends ObservableV2<any> {
     }
     this.ready = false;
     super.destroy();
-  };
+  }
 
   constructor({
     firebaseApp,

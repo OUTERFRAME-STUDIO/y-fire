@@ -1,6 +1,6 @@
 {
   "name": "y-fire",
-  "version": "2.2.0-screenweaver.1",
+  "version": "2.2.0-screenweaver.2",
   "description": "A firebase (firestore) provider for Yjs",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -8,7 +8,8 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && npm run verify:dist",
+    "verify:dist": "node --check dist/provider.js && node --check dist/index.js",
     "test": "vitest run",
     "test:watch": "vitest"
   },

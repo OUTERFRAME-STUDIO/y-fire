@@ -32,6 +32,57 @@ export class FireProvider extends ObservableV2 {
     get clientTimeOffset() {
         return this.timeOffset;
     }
+    kill(keepReadOnly = false) {
+        const _super = Object.create(null, {
+            destroy: { get: () => super.destroy }
+        });
+        return __awaiter(this, void 0, void 0, function* () {
+            if (this.firestoreTimeout || this.cache) {
+                try {
+                    yield this.saveToFirestore();
+                }
+                catch (error) {
+                    this.consoleHandler("kill: flush error", error);
+                }
+            }
+            this.instanceConnection.destroy();
+            removeEventListener("beforeunload", this.destroy);
+            removeEventListener("pagehide", this.destroy);
+            removeEventListener("visibilitychange", this.onVisibilityChange);
+            removeEventListener("pageshow", this.onPageShow);
+            if (this.recreateTimeout)
+                clearTimeout(this.recreateTimeout);
+            if (this.cacheTimeout)
+                clearTimeout(this.cacheTimeout);
+            if (this.firestoreTimeout)
+                clearTimeout(this.firestoreTimeout);
+            if (this.snapshotRetryTimeout)
+                clearTimeout(this.snapshotRetryTimeout);
+            if (this.meshRetryTimeout)
+                clearTimeout(this.meshRetryTimeout);
+            this.doc.off("update", this.updateHandler);
+            this.awareness.off("update", this.awarenessUpdateHandler);
+            deleteInstance(this.db, this.documentPath, this.uid);
+            if (this.unsubscribeData && !keepReadOnly) {
+                this.unsubscribeData();
+                delete this.unsubscribeData;
+            }
+            if (this.unsubscribeMesh) {
+                this.unsubscribeMesh();
+                delete this.unsubscribeMesh;
+            }
+            if (this.peersRTC) {
+                if (this.peersRTC.receivers) {
+                    Object.values(this.peersRTC.receivers).forEach((receiver) => receiver.destroy());
+                }
+                if (this.peersRTC.senders) {
+                    Object.values(this.peersRTC.senders).forEach((sender) => sender.destroy());
+                }
+            }
+            this.ready = false;
+            _super.destroy.call(this);
+        });
+    }
     constructor({ firebaseApp, ydoc, path, docMapper, maxUpdatesThreshold, maxWaitTime, maxWaitFirestoreTime, maxFirestoreDeferral, persistence, }) {
         super();
         this.timeOffset = 0; // offset to server time in mili seconds
@@ -457,52 +508,6 @@ export class FireProvider extends ObservableV2 {
             // and not this.destroy() or with this.destroy(args)
             void this.kill();
         };
-        this.kill = (keepReadOnly = false) => __awaiter(this, void 0, void 0, function* () {
-            if (this.firestoreTimeout || this.cache) {
-                try {
-                    yield this.saveToFirestore();
-                }
-                catch (error) {
-                    this.consoleHandler("kill: flush error", error);
-                }
-            }
-            this.instanceConnection.destroy();
-            removeEventListener("beforeunload", this.destroy);
-            removeEventListener("pagehide", this.destroy);
-            removeEventListener("visibilitychange", this.onVisibilityChange);
-            removeEventListener("pageshow", this.onPageShow);
-            if (this.recreateTimeout)
-                clearTimeout(this.recreateTimeout);
-            if (this.cacheTimeout)
-                clearTimeout(this.cacheTimeout);
-            if (this.firestoreTimeout)
-                clearTimeout(this.firestoreTimeout);
-            if (this.snapshotRetryTimeout)
-                clearTimeout(this.snapshotRetryTimeout);
-            if (this.meshRetryTimeout)
-                clearTimeout(this.meshRetryTimeout);
-            this.doc.off("update", this.updateHandler);
-            this.awareness.off("update", this.awarenessUpdateHandler);
-            deleteInstance(this.db, this.documentPath, this.uid);
-            if (this.unsubscribeData && !keepReadOnly) {
-                this.unsubscribeData();
-                delete this.unsubscribeData;
-            }
-            if (this.unsubscribeMesh) {
-                this.unsubscribeMesh();
-                delete this.unsubscribeMesh;
-            }
-            if (this.peersRTC) {
-                if (this.peersRTC.receivers) {
-                    Object.values(this.peersRTC.receivers).forEach((receiver) => receiver.destroy());
-                }
-                if (this.peersRTC.senders) {
-                    Object.values(this.peersRTC.senders).forEach((sender) => sender.destroy());
-                }
-            }
-            this.ready = false;
-            super.destroy();
-        });
         // Initializing values
         this.firebaseApp = firebaseApp;
         this.db = getFirestore(this.firebaseApp);

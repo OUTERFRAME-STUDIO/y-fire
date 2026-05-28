@@ -109,7 +109,7 @@ export declare class FireProvider extends ObservableV2<any> {
     onPageShow: () => void;
     consoleHandler: (message: any, data?: any) => void;
     destroy: () => void;
-    kill: (keepReadOnly?: boolean) => Promise<void>;
+    kill(keepReadOnly?: boolean): Promise<void>;
     constructor({ firebaseApp, ydoc, path, docMapper, maxUpdatesThreshold, maxWaitTime, maxWaitFirestoreTime, maxFirestoreDeferral, persistence, }: Parameters);
 }
 export {};
