@@ -5,6 +5,7 @@ import * as Y from "yjs";
 import { ObservableV2 } from "lib0/observable";
 import * as awarenessProtocol from "y-protocols/awareness";
 import { WebRtc } from "./webrtc";
+import { PersistenceMode } from "./persistence";
 export interface Parameters {
     firebaseApp: FirebaseApp;
     ydoc: Y.Doc;
@@ -13,6 +14,8 @@ export interface Parameters {
     maxUpdatesThreshold?: number;
     maxWaitTime?: number;
     maxWaitFirestoreTime?: number;
+    maxFirestoreDeferral?: number;
+    persistence?: PersistenceMode;
 }
 interface PeersRTC {
     receivers: {
@@ -52,11 +55,20 @@ export declare class FireProvider extends ObservableV2<any> {
     maxRTCWait: number;
     firestoreTimeout: string | number | NodeJS.Timeout;
     maxFirestoreWait: number;
+    maxFirestoreDeferral: number;
+    scheduledFirstAt?: number;
     firebaseDataLastUpdatedAt: number;
     instanceConnection: ObservableV2<any>;
     recreateTimeout: string | number | NodeJS.Timeout;
     private unsubscribeData?;
     private unsubscribeMesh?;
+    private persistenceAdapter;
+    private persistenceMode;
+    private snapshotRetryAttempt;
+    private meshRetryAttempt;
+    private snapshotRetryTimeout?;
+    private meshRetryTimeout?;
+    private dataListenerPaused;
     get clientTimeOffset(): number;
     ready: boolean;
     onReady: () => void;
@@ -67,6 +79,8 @@ export declare class FireProvider extends ObservableV2<any> {
     saveToLocal: () => Promise<void>;
     deleteLocal: () => Promise<void>;
     initiateHandler: () => void;
+    private scheduleSnapshotRetry;
+    private scheduleMeshRetry;
     trackData: () => void;
     trackMesh: () => void;
     reconnect: () => void;
@@ -90,10 +104,13 @@ export declare class FireProvider extends ObservableV2<any> {
         updated: number[];
         removed: number[];
     }, origin: unknown) => void;
+    flushOnHide: () => void;
+    onVisibilityChange: () => void;
+    onPageShow: () => void;
     consoleHandler: (message: any, data?: any) => void;
     destroy: () => void;
-    kill: (keepReadOnly?: boolean) => void;
-    constructor({ firebaseApp, ydoc, path, docMapper, maxUpdatesThreshold, maxWaitTime, maxWaitFirestoreTime, }: Parameters);
+    kill: (keepReadOnly?: boolean) => Promise<void>;
+    constructor({ firebaseApp, ydoc, path, docMapper, maxUpdatesThreshold, maxWaitTime, maxWaitFirestoreTime, maxFirestoreDeferral, persistence, }: Parameters);
 }
 export {};
 //# sourceMappingURL=provider.d.ts.map
