@@ -491,6 +491,11 @@ export class FireProvider extends ObservableV2 {
             if (document.visibilityState === "hidden") {
                 this.flushOnHide();
             }
+            else if (document.visibilityState === "visible") {
+                if (this.dataListenerPaused) {
+                    this.trackData();
+                }
+            }
         };
         this.onPageShow = () => {
             if (this.dataListenerPaused) {
