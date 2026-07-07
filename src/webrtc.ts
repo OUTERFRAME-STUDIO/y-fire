@@ -158,7 +158,7 @@ export class WebRtc extends ObservableV2<any> {
         await setDoc(callRef, { signal });
 
         setTimeout(() => {
-          deleteDoc(callRef);
+          deleteDoc(callRef).catch((error) => this.errorHandler(error));
         }, this.idleThreshold); // delete call after defined miliseconds, if handshake hasn't deleted it yet
       } catch (error) {
         this.errorHandler(error);
@@ -187,7 +187,7 @@ export class WebRtc extends ObservableV2<any> {
         await setDoc(answerRef, { signal });
 
         setTimeout(() => {
-          deleteDoc(answerRef);
+          deleteDoc(answerRef).catch((error) => this.errorHandler(error));
         }, this.idleThreshold); // delete call after defined miliseconds, if handshake hasn't deleted it yet
       } catch (error) {
         this.errorHandler(error);
@@ -249,7 +249,9 @@ export class WebRtc extends ObservableV2<any> {
           this.uid
         );
       }
-      deleteDoc(ref);
+      deleteDoc(ref).catch(() => {
+        // permission-denied during teardown is expected and non-fatal
+      });
     } catch (error) {
       // this.consoleHandler("delete signals error", error);
     }

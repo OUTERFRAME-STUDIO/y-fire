@@ -79,7 +79,7 @@ export class WebRtc extends ObservableV2 {
                     const callRef = doc(this.db, `${this.documentPath}/instances/${this.peerUid}/calls`, this.uid);
                     yield setDoc(callRef, { signal });
                     setTimeout(() => {
-                        deleteDoc(callRef);
+                        deleteDoc(callRef).catch((error) => this.errorHandler(error));
                     }, this.idleThreshold); // delete call after defined miliseconds, if handshake hasn't deleted it yet
                 }
                 catch (error) {
@@ -102,7 +102,7 @@ export class WebRtc extends ObservableV2 {
                     const answerRef = doc(this.db, `${this.documentPath}/instances/${this.peerUid}/answers`, this.uid);
                     yield setDoc(answerRef, { signal });
                     setTimeout(() => {
-                        deleteDoc(answerRef);
+                        deleteDoc(answerRef).catch((error) => this.errorHandler(error));
                     }, this.idleThreshold); // delete call after defined miliseconds, if handshake hasn't deleted it yet
                 }
                 catch (error) {
@@ -148,7 +148,9 @@ export class WebRtc extends ObservableV2 {
                 else {
                     ref = doc(this.db, `${this.documentPath}/instances/${this.peerUid}/answers`, this.uid);
                 }
-                deleteDoc(ref);
+                deleteDoc(ref).catch(() => {
+                    // permission-denied during teardown is expected and non-fatal
+                });
             }
             catch (error) {
                 // this.consoleHandler("delete signals error", error);

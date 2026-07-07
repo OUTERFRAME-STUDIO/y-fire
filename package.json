@@ -1,6 +1,6 @@
 {
   "name": "y-fire",
-  "version": "2.2.0-screenweaver.3",
+  "version": "2.2.0-screenweaver.4",
   "description": "A firebase (firestore) provider for Yjs",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
