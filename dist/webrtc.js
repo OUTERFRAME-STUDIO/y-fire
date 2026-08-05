@@ -176,8 +176,17 @@ export class WebRtc extends ObservableV2 {
                 msg.data = yield Uint8ArrayToBase64(data);
             }
             const encrypted = yield encryptData(msg, this.peerKey);
-            if (this.connection === "connected" && encrypted)
+            // Re-check after encrypt await — channel may have closed during the race
+            // (Safari InvalidStateError / Chrome readyState not open on peer.send).
+            if (this.connection !== "connected" || !encrypted || !this.peer)
+                return;
+            try {
                 this.peer.send(encrypted);
+            }
+            catch (error) {
+                // Channel closed mid-flight; destroy path will reconnect via mesh.
+                this.errorHandler(error);
+            }
         });
         this.handleReceivingData = (data) => __awaiter(this, void 0, void 0, function* () {
             try {

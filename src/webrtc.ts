@@ -284,7 +284,15 @@ export class WebRtc extends ObservableV2<any> {
       msg.data = await Uint8ArrayToBase64(data);
     }
     const encrypted = await encryptData(msg, this.peerKey);
-    if (this.connection === "connected" && encrypted) this.peer.send(encrypted);
+    // Re-check after encrypt await — channel may have closed during the race
+    // (Safari InvalidStateError / Chrome readyState not open on peer.send).
+    if (this.connection !== "connected" || !encrypted || !this.peer) return;
+    try {
+      this.peer.send(encrypted);
+    } catch (error) {
+      // Channel closed mid-flight; destroy path will reconnect via mesh.
+      this.errorHandler(error);
+    }
   };
 
   handleReceivingData = async (data: any) => {
