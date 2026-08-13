@@ -9,7 +9,7 @@ https://github.com/podraven/y-fire/assets/2324523/3aa27a40-6cfb-4b93-b043-4e0fa5
 # Features
 
 1. Utilizes a peer-to-peer network to exchange real-time data and awareness.
-2. Utilizes Firestore as persistent storage and syncs with Firestore periodically to maintain persistent data state.
+2. Utilizes Firestore as persistent storage and syncs with Firestore periodically to maintain persistent data state. Writes are a **transactional Yjs union** (re-read `content`, `Y.applyUpdate` remote + local, write the merged update). `{ merge: true }` only merges Firestore *fields* — it does not merge CRDT state by itself.
 3. Utilizes Firestore as a peer discovery platform. Once peers are connected to each other, real-time updates are shared without accessing Firestore, thus reducing costs.
 4. Instead of connecting all peers to each other, y-fire creates clusters of clients. Clients within a cluster are connected to each other, and clusters are connected to each other through one common client. If clients leave or new clients join, clusters are recreated. Limiting client connections to limited number of peers thus improves performance. (Discussion: [WebRTC: peer connections limit](https://stackoverflow.com/questions/16015304/webrtc-peer-connections-limit))
 5. You can set wait times and thresholds.
@@ -60,13 +60,19 @@ Tiptap example:
 const provider = yProvider("path/to/your/firestore/document");
 
 provider.onReady = () => {
-  // do something
+  // cache or server snapshot exists
+};
+provider.onServerReady = () => {
+  // safe to seed / flush; server snapshot (or confirmed-missing doc) applied
 };
 provider.onDeleted = () => {
   // do something
 };
 provider.onSaving = (status) => {
   // do something
+};
+provider.onSaveError = (error, ctx) => {
+  // persist failed — keep unsaved UI
 };
 
 ...
@@ -143,9 +149,12 @@ new FireProvider({
 
 #### Events
 
-- **onReady**: Triggered after the first connection has been established to Firestore (initial data fetch).
+- **onReady**: Triggered after the first snapshot in which the Firestore document `exists()` (may be the persistent cache).
+- **onServerReady**: Triggered once a snapshot with `metadata.fromCache === false` has been applied (server confirmation, including a confirmed-missing document). IndexedDB `syncLocal` and hide/unload flushes wait for this.
 - **onDeleted**: Triggered if the instance was deleted (e.g., no permission to read/write the document).
-- **onSaving**: Triggered when the sync to Firestore is in process (e.g., you may want to alert users not to close the window).
+- **onSaving**: Triggered when the sync to Firestore is in process (e.g., you may want to alert users not to close the window). `onSaving(false)` runs only after a **successful** write.
+- **onSaveError**: Triggered when a merge-write fails or encoded `content` exceeds 1 MiB (`reason`: `save-failed` | `size-abort`). The UI should treat this as unsaved; y-fire retries failed network writes and never falls back to last-write-wins `setDoc`.
+- **onSaveWarning**: Triggered when encoded `content` is ≥ 70% of 1 MiB (`size-warn`) or the local replica is missing structs already on the server (`shrink`). The write still proceeds (union) unless size-abort.
 
 Example:
 

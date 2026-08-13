@@ -3,6 +3,8 @@ import { setDocCalls, onSnapshotCallCount } from "./_mocks/firestore";
 import {
   createTestProvider,
   flushMicrotasks,
+  markServerReady,
+  TEST_PATH,
 } from "./helpers";
 import {
   fireLifecycleEvent,
@@ -15,8 +17,9 @@ describe("pagehide flush", () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
   });
 
-  it("pagehide triggers a Firestore flush via destroy", async () => {
+  it("pagehide triggers a Firestore flush via destroy once server-ready", async () => {
     const { provider } = await createTestProvider();
+    await markServerReady(TEST_PATH);
     provider.sendToFirestoreQueue();
 
     fireLifecycleEvent("pagehide");
@@ -25,29 +28,35 @@ describe("pagehide flush", () => {
     expect(setDocCalls.length).toBe(1);
   });
 
-  it("visibility hidden triggers flushOnHide without full destroy", async () => {
+  it("visibility hidden flushes only after serverReady", async () => {
     const { provider } = await createTestProvider();
     provider.sendToFirestoreQueue();
     const callsBefore = setDocCalls.length;
 
     setVisibilityState("hidden");
     await flushMicrotasks();
+    expect(setDocCalls.length).toBe(callsBefore);
+
+    await markServerReady(TEST_PATH);
+    provider.sendToFirestoreQueue();
+    setVisibilityState("hidden");
+    await flushMicrotasks();
 
     expect(setDocCalls.length).toBe(callsBefore + 1);
   });
 
-  it("pageshow re-arms trackData without double-flushing", async () => {
+  it("pageshow does not re-subscribe because hide no longer unsubscribes", async () => {
     const { provider } = await createTestProvider();
+    const subscriptionsAfterInit = onSnapshotCallCount;
     setVisibilityState("hidden");
     await flushMicrotasks();
     const callsAfterHide = setDocCalls.length;
-    const subscriptionsAfterHide = onSnapshotCallCount;
 
     firePageShow();
     await flushMicrotasks();
 
     expect(setDocCalls.length).toBe(callsAfterHide);
-    expect(onSnapshotCallCount).toBeGreaterThan(subscriptionsAfterHide);
+    expect(onSnapshotCallCount).toBe(subscriptionsAfterInit);
     void provider;
   });
 });

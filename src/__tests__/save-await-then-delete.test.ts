@@ -1,27 +1,26 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { setSetDocImpl } from "./_mocks/firestore";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { setTransactionError } from "./_mocks/firestore";
 import { del, getIdbDeleteCount } from "./_mocks/idb";
-import { createTestProvider } from "./helpers";
+import { createTestProvider, markServerReady, TEST_PATH } from "./helpers";
 
 describe("save await then delete", () => {
   beforeEach(() => {
     vi.spyOn(console, "log").mockImplementation(() => {});
   });
 
-  it("does not deleteLocal when setDoc rejects", async () => {
+  it("does not deleteLocal when the merge transaction rejects", async () => {
     const { provider } = await createTestProvider();
-    setSetDocImpl(async () => {
-      throw new Error("network error");
-    });
+    await markServerReady(TEST_PATH);
+    setTransactionError(new Error("network error"));
 
     await provider.saveToFirestore();
 
     expect(getIdbDeleteCount()).toBe(0);
   });
 
-  it("deletes local exactly once when setDoc resolves", async () => {
+  it("deletes local exactly once when the merge transaction resolves", async () => {
     const { provider } = await createTestProvider();
-    setSetDocImpl(async () => {});
+    await markServerReady(TEST_PATH);
 
     await provider.saveToFirestore();
 

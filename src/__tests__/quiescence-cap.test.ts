@@ -4,6 +4,7 @@ import { setDocCalls } from "./_mocks/firestore";
 import {
   createTestProvider,
   emitRemoteUpdate,
+  markServerReady,
   TEST_PATH,
 } from "./helpers";
 
@@ -27,6 +28,7 @@ describe("quiescence cap", () => {
       maxFirestoreDeferral: 200,
     });
 
+    await markServerReady(TEST_PATH);
     provider.sendToFirestoreQueue();
 
     for (let t = 0; t <= 180; t += 30) {

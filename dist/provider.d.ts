@@ -6,6 +6,16 @@ import { ObservableV2 } from "lib0/observable";
 import * as awarenessProtocol from "y-protocols/awareness";
 import { WebRtc } from "./webrtc";
 import { PersistenceMode } from "./persistence";
+export type FireSaveReason = "save-failed" | "size-abort" | "size-warn" | "shrink";
+export interface FireSaveContext {
+    documentPath: string;
+    byteLength: number;
+    code?: string;
+    fromCache: boolean;
+    ready: boolean;
+    serverReady: boolean;
+    reason: FireSaveReason;
+}
 export interface Parameters {
     firebaseApp: FirebaseApp;
     ydoc: Y.Doc;
@@ -16,6 +26,8 @@ export interface Parameters {
     maxWaitFirestoreTime?: number;
     maxFirestoreDeferral?: number;
     persistence?: PersistenceMode;
+    /** Override Firestore `content` size cap (bytes). Defaults to 1 MiB. */
+    maxContentBytes?: number;
 }
 interface PeersRTC {
     receivers: {
@@ -56,6 +68,7 @@ export declare class FireProvider extends ObservableV2<any> {
     firestoreTimeout: string | number | NodeJS.Timeout;
     maxFirestoreWait: number;
     maxFirestoreDeferral: number;
+    maxContentBytes: number;
     scheduledFirstAt?: number;
     firebaseDataLastUpdatedAt: number;
     instanceConnection: ObservableV2<any>;
@@ -68,12 +81,20 @@ export declare class FireProvider extends ObservableV2<any> {
     private meshRetryAttempt;
     private snapshotRetryTimeout?;
     private meshRetryTimeout?;
+    private saveRetryTimeout?;
     private dataListenerPaused;
+    private pendingSyncLocal;
+    private lastServerStateVector?;
+    private lastSnapshotFromCache;
     get clientTimeOffset(): number;
     ready: boolean;
+    serverReady: boolean;
     onReady: () => void;
+    onServerReady: () => void;
     onDeleted: () => void;
     onSaving: (status: boolean) => void;
+    onSaveError: (error: unknown, ctx: FireSaveContext) => void;
+    onSaveWarning: (ctx: FireSaveContext) => void;
     init: () => Promise<void>;
     syncLocal: () => Promise<void>;
     saveToLocal: () => Promise<void>;
@@ -91,6 +112,8 @@ export declare class FireProvider extends ObservableV2<any> {
         message: unknown;
         data: Uint8Array | null;
     }) => void;
+    private saveContext;
+    private scheduleSaveRetry;
     saveToFirestore: () => Promise<void>;
     sendToFirestoreQueue: () => void;
     sendCache: (from: string) => void;
@@ -110,7 +133,7 @@ export declare class FireProvider extends ObservableV2<any> {
     consoleHandler: (message: any, data?: any) => void;
     destroy: () => void;
     kill(keepReadOnly?: boolean): Promise<void>;
-    constructor({ firebaseApp, ydoc, path, docMapper, maxUpdatesThreshold, maxWaitTime, maxWaitFirestoreTime, maxFirestoreDeferral, persistence, }: Parameters);
+    constructor({ firebaseApp, ydoc, path, docMapper, maxUpdatesThreshold, maxWaitTime, maxWaitFirestoreTime, maxFirestoreDeferral, persistence, maxContentBytes, }: Parameters);
 }
 export {};
 //# sourceMappingURL=provider.d.ts.map

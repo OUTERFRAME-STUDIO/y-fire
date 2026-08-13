@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { onSnapshotCallCount } from "./_mocks/firestore";
-import { createTestProvider, flushMicrotasks } from "./helpers";
+import { onSnapshotCallCount, snapshotSubscriptions } from "./_mocks/firestore";
+import { createTestProvider, flushMicrotasks, TEST_PATH } from "./helpers";
 import { setVisibilityState } from "./_mocks/lifecycle";
 
 describe("visibility resubscribe", () => {
@@ -8,19 +8,20 @@ describe("visibility resubscribe", () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
   });
 
-  it("visibility visible re-subscribes onSnapshot after hidden pause", async () => {
+  it("visibility hidden does not unsubscribe trackData", async () => {
     const { provider } = await createTestProvider();
     const subscriptionsAfterInit = onSnapshotCallCount;
 
     setVisibilityState("hidden");
     await flushMicrotasks();
-    const subscriptionsAfterHide = onSnapshotCallCount;
+
+    expect(onSnapshotCallCount).toBe(subscriptionsAfterInit);
+    expect(snapshotSubscriptions.has(TEST_PATH)).toBe(true);
 
     setVisibilityState("visible");
     await flushMicrotasks();
 
-    expect(subscriptionsAfterHide).toBe(subscriptionsAfterInit);
-    expect(onSnapshotCallCount).toBeGreaterThan(subscriptionsAfterHide);
+    expect(onSnapshotCallCount).toBe(subscriptionsAfterInit);
     void provider;
   });
 });
