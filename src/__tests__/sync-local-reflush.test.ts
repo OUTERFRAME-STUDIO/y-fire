@@ -5,6 +5,7 @@ import { get, idbStore } from "./_mocks/idb";
 import {
   createTestProvider,
   TEST_PATH,
+  markServerReady,
 } from "./helpers";
 
 describe("syncLocal re-flush", () => {
@@ -28,6 +29,7 @@ describe("syncLocal re-flush", () => {
     });
 
     idbStore.set(TEST_PATH, localBytes);
+    await markServerReady(TEST_PATH);
     await provider.syncLocal();
     await vi.advanceTimersByTimeAsync(20);
 

@@ -1,7 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import * as Y from "yjs";
 import { setDocCalls } from "./_mocks/firestore";
-import { createTestProvider, flushMicrotasks } from "./helpers";
+import {
+  createTestProvider,
+  flushMicrotasks,
+  markServerReady,
+  TEST_PATH,
+} from "./helpers";
 
 describe("destroy flush", () => {
   beforeEach(() => {
@@ -10,6 +15,7 @@ describe("destroy flush", () => {
 
   it("drains pending Firestore queue on kill when cache is pending", async () => {
     const { provider, ydoc } = await createTestProvider();
+    await markServerReady(TEST_PATH);
     const update = Y.encodeStateAsUpdate(ydoc);
     provider.cache = update;
 
@@ -20,6 +26,7 @@ describe("destroy flush", () => {
 
   it("drains pending Firestore queue on destroy when firestoreTimeout is set", async () => {
     const { provider } = await createTestProvider();
+    await markServerReady(TEST_PATH);
     provider.sendToFirestoreQueue();
     expect(provider.firestoreTimeout).toBeTruthy();
 
@@ -27,5 +34,14 @@ describe("destroy flush", () => {
     await flushMicrotasks();
 
     expect(setDocCalls.length).toBe(1);
+  });
+
+  it("does not flush on kill before serverReady", async () => {
+    const { provider, ydoc } = await createTestProvider();
+    provider.cache = Y.encodeStateAsUpdate(ydoc);
+
+    await provider.kill();
+
+    expect(setDocCalls.length).toBe(0);
   });
 });
