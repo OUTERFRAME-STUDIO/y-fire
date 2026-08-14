@@ -3,6 +3,7 @@ export type {
   Parameters as FireProviderConfig,
   FireSaveContext,
   FireSaveReason,
+  EpochReplaceEvent,
 } from "./provider";
 export type { PersistenceMode } from "./persistence";
 export {

@@ -1,15 +1,21 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import * as Y from "yjs";
-import { setDocCalls, setTransactionError } from "./_mocks/firestore";
+import {
+  addDocCalls,
+  setAddDocError,
+  setDocCalls,
+  setTransactionError,
+} from "./_mocks/firestore";
 import { getIdbDeleteCount } from "./_mocks/idb";
 import { setVisibilityState } from "./_mocks/lifecycle";
 import {
   createTestProvider,
-  decodeSavedDoc,
+  decodeUpdateBytes,
   emitCacheUpdate,
   emitServerMissing,
   emitServerUpdate,
   flushMicrotasks,
+  hydrateControl,
   markServerReady,
   TEST_PATH,
   FireProvider,
@@ -25,12 +31,13 @@ function lineage(): { cacheBytes: Uint8Array; serverBytes: Uint8Array } {
   return { cacheBytes, serverBytes };
 }
 
-describe("merge-on-write", () => {
+describe("stale-replica append (merge-on-write successor)", () => {
   let provider: FireProvider | undefined;
 
   beforeEach(() => {
     vi.spyOn(console, "log").mockImplementation(() => {});
     setTransactionError(null);
+    setAddDocError(null);
     provider = undefined;
   });
 
@@ -42,7 +49,7 @@ describe("merge-on-write", () => {
     vi.mocked(console.log).mockRestore();
   });
 
-  it("PATH 1: debounce after server snapshot writes the union", async () => {
+  it("PATH 1: debounce after server snapshot appends a delta that preserves remote structs", async () => {
     const { cacheBytes, serverBytes } = lineage();
     const created = await createTestProvider({
       maxWaitFirestoreTime: 50,
@@ -60,8 +67,9 @@ describe("merge-on-write", () => {
 
     await provider.saveToFirestore();
 
-    expect(setDocCalls.length).toBe(1);
-    const saved = decodeSavedDoc(setDocCalls[0]?.data);
+    expect(addDocCalls.length).toBe(1);
+    const delta = decodeUpdateBytes(addDocCalls[0]?.data);
+    const saved = hydrateControl(serverBytes, [delta]);
     expect(saved.getText("old").toString()).toBe("old");
     expect(saved.getText("new").toString()).toBe("new");
     expect(saved.getText("promptPatch").toString()).toBe("promptPatch");
@@ -83,6 +91,7 @@ describe("merge-on-write", () => {
     setVisibilityState("hidden");
     await flushMicrotasks();
 
+    expect(addDocCalls.length).toBe(0);
     expect(setDocCalls.length).toBe(0);
     expect(provider.serverReady).toBe(false);
 
@@ -91,8 +100,11 @@ describe("merge-on-write", () => {
     provider.sendToFirestoreQueue();
     await provider.saveToFirestore();
 
-    expect(setDocCalls.length).toBe(1);
-    const saved = decodeSavedDoc(setDocCalls[0]?.data);
+    expect(addDocCalls.length).toBe(1);
+    const saved = hydrateControl(
+      serverBytes,
+      [decodeUpdateBytes(addDocCalls[0]?.data)],
+    );
     expect(saved.getText("new").toString()).toBe("new");
     expect(saved.getText("promptPatch").toString()).toBe("promptPatch");
   });
@@ -102,9 +114,10 @@ describe("merge-on-write", () => {
     provider = created.provider;
     await provider.saveToFirestore();
     expect(setDocCalls.length).toBe(0);
+    expect(addDocCalls.length).toBe(0);
   });
 
-  it("PATH 5: applying merged bytes back does not re-arm the Firestore queue", async () => {
+  it("PATH 5: applying appended bytes back does not re-arm the Firestore queue", async () => {
     const remoteDoc = new Y.Doc();
     remoteDoc.getText("remote").insert(0, "only-on-server");
     const serverBytes = Y.encodeStateAsUpdate(remoteDoc);
@@ -127,10 +140,11 @@ describe("merge-on-write", () => {
     expect(queueSpy).not.toHaveBeenCalled();
   });
 
-  it("offline transaction failure does not setDoc, keeps IDB, calls onSaveError, skips onSaving(false)", async () => {
+  it("offline transaction failure on first snapshot write keeps IDB and skips onSaving(false)", async () => {
     const created = await createTestProvider();
     provider = created.provider;
     await markServerReady(TEST_PATH);
+    created.ydoc.getText("t").insert(0, "x");
     const onSaving = vi.fn();
     const onSaveError = vi.fn();
     provider.onSaving = onSaving;
@@ -143,21 +157,24 @@ describe("merge-on-write", () => {
     await provider.saveToFirestore();
 
     expect(setDocCalls.length).toBe(0);
+    expect(addDocCalls.length).toBe(0);
     expect(getIdbDeleteCount()).toBe(0);
     expect(onSaveError).toHaveBeenCalled();
     expect(onSaving).not.toHaveBeenCalledWith(false);
   });
 
-  it("aborts the write when merged content exceeds 1 MiB", async () => {
+  it("aborts the write when a first snapshot exceeds 1 MiB", async () => {
     const created = await createTestProvider({ maxContentBytes: 1 });
     provider = created.provider;
     await markServerReady(TEST_PATH);
+    created.ydoc.getText("t").insert(0, "too-big-for-one-byte-cap");
     const onSaveError = vi.fn();
     provider.onSaveError = onSaveError;
 
     await provider.saveToFirestore();
 
     expect(setDocCalls.length).toBe(0);
+    expect(addDocCalls.length).toBe(0);
     expect(onSaveError.mock.calls.map((c) => (c[1] as { reason?: string })?.reason)).toContain(
       "size-abort",
     );
@@ -200,13 +217,11 @@ describe("merge-on-write", () => {
     expect(provider.ready).toBe(false);
   });
 
-  it("emits shrink warning when local replica is missing remote structs, still writes the union", async () => {
+  it("stale replica append preserves structs it lacked", async () => {
     const { cacheBytes, serverBytes } = lineage();
     const created = await createTestProvider();
     provider = created.provider;
     const { ydoc } = created;
-    const onSaveWarning = vi.fn();
-    provider.onSaveWarning = onSaveWarning;
 
     emitCacheUpdate(TEST_PATH, cacheBytes);
     await flushMicrotasks();
@@ -216,11 +231,25 @@ describe("merge-on-write", () => {
 
     await provider.saveToFirestore();
 
-    expect(onSaveWarning).toHaveBeenCalled();
-    const ctx = onSaveWarning.mock.calls[0]?.[0] as { reason?: string };
-    expect(ctx.reason).toBe("shrink");
-    expect(setDocCalls.length).toBeGreaterThan(0);
-    const saved = decodeSavedDoc(setDocCalls[setDocCalls.length - 1]?.data);
+    expect(addDocCalls.length + setDocCalls.length).toBeGreaterThan(0);
+    const parts: Uint8Array[] = [serverBytes];
+    if (addDocCalls.length > 0) {
+      parts.push(decodeUpdateBytes(addDocCalls[addDocCalls.length - 1]?.data));
+    }
+    const saved =
+      addDocCalls.length > 0
+        ? hydrateControl(serverBytes, [
+            decodeUpdateBytes(addDocCalls[addDocCalls.length - 1]?.data),
+          ])
+        : hydrateControl(
+            (
+              setDocCalls[setDocCalls.length - 1]?.data as {
+                content: { toUint8Array: () => Uint8Array };
+              }
+            ).content.toUint8Array(),
+            [],
+          );
+    void parts;
     expect(saved.getText("new").toString()).toBe("new");
     expect(saved.getText("local").toString()).toBe("patch");
   });

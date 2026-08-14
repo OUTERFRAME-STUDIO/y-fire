@@ -1,6 +1,6 @@
 /// <reference types="node" />
 import { FirebaseApp } from "@firebase/app";
-import { Firestore, Bytes } from "@firebase/firestore";
+import { Firestore, type Bytes } from "@firebase/firestore";
 import * as Y from "yjs";
 import { ObservableV2 } from "lib0/observable";
 import * as awarenessProtocol from "y-protocols/awareness";
@@ -16,6 +16,10 @@ export interface FireSaveContext {
     serverReady: boolean;
     reason: FireSaveReason;
 }
+export interface EpochReplaceEvent {
+    from: number;
+    to: number;
+}
 export interface Parameters {
     firebaseApp: FirebaseApp;
     ydoc: Y.Doc;
@@ -28,6 +32,12 @@ export interface Parameters {
     persistence?: PersistenceMode;
     /** Override Firestore `content` size cap (bytes). Defaults to 1 MiB. */
     maxContentBytes?: number;
+    /** Fold `updates/*` when count reaches this (default 20). */
+    foldUpdateThreshold?: number;
+    /** Fold when update bytes reach this fraction of the content cap (default 0.5). */
+    foldBytesFraction?: number;
+    /** Epoch field name; defaults to `contentGeneration`. */
+    epochField?: string;
 }
 interface PeersRTC {
     receivers: {
@@ -84,8 +94,18 @@ export declare class FireProvider extends ObservableV2<any> {
     private saveRetryTimeout?;
     private dataListenerPaused;
     private pendingSyncLocal;
-    private lastServerStateVector?;
+    private lastPersistedSV?;
     private lastSnapshotFromCache;
+    private hasRemoteContent;
+    private hydratedEpoch?;
+    private epochReplaced;
+    private appliedUpdateIds;
+    private lastSeq;
+    private docServerSnapshot;
+    private updatesServerSnapshot;
+    private foldUpdateThreshold;
+    private foldBytesFraction;
+    private epochField;
     get clientTimeOffset(): number;
     ready: boolean;
     serverReady: boolean;
@@ -95,6 +115,7 @@ export declare class FireProvider extends ObservableV2<any> {
     onSaving: (status: boolean) => void;
     onSaveError: (error: unknown, ctx: FireSaveContext) => void;
     onSaveWarning: (ctx: FireSaveContext) => void;
+    onEpochReplace: (event: EpochReplaceEvent) => void;
     init: () => Promise<void>;
     syncLocal: () => Promise<void>;
     saveToLocal: () => Promise<void>;
@@ -102,6 +123,8 @@ export declare class FireProvider extends ObservableV2<any> {
     initiateHandler: () => void;
     private scheduleSnapshotRetry;
     private scheduleMeshRetry;
+    private maybeBecomeServerReady;
+    private applyRemoteUpdateBytes;
     trackData: () => void;
     trackMesh: () => void;
     reconnect: () => void;
@@ -115,6 +138,10 @@ export declare class FireProvider extends ObservableV2<any> {
     private saveContext;
     private scheduleSaveRetry;
     saveToFirestore: () => Promise<void>;
+    private abortSize;
+    private writeFirstSnapshot;
+    private appendDelta;
+    private maybeFold;
     sendToFirestoreQueue: () => void;
     sendCache: (from: string) => void;
     sendToQueue: ({ from, update }: {
@@ -133,7 +160,7 @@ export declare class FireProvider extends ObservableV2<any> {
     consoleHandler: (message: any, data?: any) => void;
     destroy: () => void;
     kill(keepReadOnly?: boolean): Promise<void>;
-    constructor({ firebaseApp, ydoc, path, docMapper, maxUpdatesThreshold, maxWaitTime, maxWaitFirestoreTime, maxFirestoreDeferral, persistence, maxContentBytes, }: Parameters);
+    constructor({ firebaseApp, ydoc, path, docMapper, maxUpdatesThreshold, maxWaitTime, maxWaitFirestoreTime, maxFirestoreDeferral, persistence, maxContentBytes, foldUpdateThreshold, foldBytesFraction, epochField, }: Parameters);
 }
 export {};
 //# sourceMappingURL=provider.d.ts.map

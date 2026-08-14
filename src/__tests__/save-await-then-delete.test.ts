@@ -24,6 +24,8 @@ describe("save await then delete", () => {
 
     await provider.saveToFirestore();
 
-    expect(del).toHaveBeenCalledTimes(1);
+    expect(del.mock.calls.map((c) => c[0])).toEqual(
+      expect.arrayContaining([TEST_PATH, `${TEST_PATH}#meta`]),
+    );
   });
 });

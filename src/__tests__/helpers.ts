@@ -3,8 +3,12 @@ import * as Y from "yjs";
 import type { FirebaseApp } from "@firebase/app";
 import {
   emitSnapshot,
+  emitUpdatesSnapshot,
   resetFirestoreMock,
   seedFirestoreContent,
+  seedFirestoreShard,
+  seedFirestoreUpdate,
+  updatesPath,
 } from "./_mocks/firestore";
 import { resetIdbMock } from "./_mocks/idb";
 
@@ -81,34 +85,75 @@ export function emitEmptyDocSnapshot(path: string) {
     data: () => ({}),
     metadata: { fromCache: false, hasPendingWrites: false },
   });
+  emitUpdatesSnapshot(path, { fromCache: false, hasPendingWrites: false });
 }
 
 export function emitRemoteUpdate(path: string, content: Uint8Array) {
   emitServerUpdate(path, content);
 }
 
-export function emitCacheUpdate(path: string, content: Uint8Array) {
+export function emitCacheUpdate(
+  path: string,
+  content: Uint8Array,
+  extra?: { epoch?: number; snapshotSV?: Uint8Array },
+) {
   emitSnapshot(path, {
     exists: () => true,
-    data: () => ({
-      content: {
-        toUint8Array: () => content,
-      },
-    }),
+    data: () => shardData(content, extra),
     metadata: { fromCache: true, hasPendingWrites: false },
   });
+  emitUpdatesSnapshot(path, { fromCache: true, hasPendingWrites: false });
 }
 
-export function emitServerUpdate(path: string, content: Uint8Array) {
-  seedFirestoreContent(path, content);
+function shardData(
+  content: Uint8Array,
+  extra?: { epoch?: number; snapshotSV?: Uint8Array },
+) {
+  const data: Record<string, unknown> = {
+    content: {
+      toUint8Array: () => content,
+    },
+  };
+  if (extra?.epoch !== undefined) {
+    data.contentGeneration = extra.epoch;
+  }
+  if (extra?.snapshotSV) {
+    data.snapshotSV = {
+      toUint8Array: () => extra.snapshotSV,
+    };
+  }
+  return data;
+}
+
+export function emitServerUpdate(
+  path: string,
+  content: Uint8Array,
+  extra?: { epoch?: number; snapshotSV?: Uint8Array; emitUpdates?: boolean },
+) {
+  seedFirestoreShard(path, content, extra);
   emitSnapshot(path, {
     exists: () => true,
-    data: () => ({
-      content: {
-        toUint8Array: () => content,
-      },
-    }),
+    data: () => shardData(content, extra),
     metadata: { fromCache: false, hasPendingWrites: false },
+  });
+  if (extra?.emitUpdates !== false) {
+    emitUpdatesSnapshot(path, { fromCache: false, hasPendingWrites: false });
+  }
+}
+
+export function emitDocSnapshotOnly(
+  path: string,
+  content: Uint8Array,
+  extra?: { epoch?: number; snapshotSV?: Uint8Array; fromCache?: boolean },
+) {
+  seedFirestoreShard(path, content, extra);
+  emitSnapshot(path, {
+    exists: () => true,
+    data: () => shardData(content, extra),
+    metadata: {
+      fromCache: extra?.fromCache === true,
+      hasPendingWrites: false,
+    },
   });
 }
 
@@ -118,6 +163,7 @@ export async function emitServerMissing(path: string) {
     data: () => undefined,
     metadata: { fromCache: false, hasPendingWrites: false },
   });
+  emitUpdatesSnapshot(path, { fromCache: false, hasPendingWrites: false });
   await flushMicrotasks();
 }
 
@@ -137,6 +183,23 @@ export function decodeSavedDoc(saved: unknown): Y.Doc {
   const data = saved as { content: { toUint8Array: () => Uint8Array } };
   const doc = new Y.Doc();
   Y.applyUpdate(doc, data.content.toUint8Array());
+  return doc;
+}
+
+export function decodeUpdateBytes(saved: unknown): Uint8Array {
+  const data = saved as { update: { toUint8Array: () => Uint8Array } };
+  return data.update.toUint8Array();
+}
+
+export function hydrateControl(
+  snapshot: Uint8Array,
+  updates: Uint8Array[],
+): Y.Doc {
+  const doc = new Y.Doc();
+  if (snapshot.byteLength > 0) Y.applyUpdate(doc, snapshot);
+  for (const u of updates) {
+    if (u.byteLength > 0) Y.applyUpdate(doc, u);
+  }
   return doc;
 }
 

@@ -2,6 +2,28 @@ import { get, set, del } from "idb-keyval";
 
 export type PersistenceMode = "indexeddb" | "none";
 
+export const PERSISTENCE_META_SUFFIX = "#meta";
+
+export function persistenceMetaKey(documentPath: string): string {
+  return `${documentPath}${PERSISTENCE_META_SUFFIX}`;
+}
+
+export function encodeEpochMeta(epoch: number): Uint8Array {
+  return new TextEncoder().encode(JSON.stringify({ epoch }));
+}
+
+export function decodeEpochMeta(bytes: Uint8Array | undefined): number {
+  if (!bytes || bytes.byteLength === 0) return 0;
+  try {
+    const parsed = JSON.parse(new TextDecoder().decode(bytes)) as {
+      epoch?: unknown;
+    };
+    return typeof parsed.epoch === "number" ? parsed.epoch : 0;
+  } catch {
+    return 0;
+  }
+}
+
 export interface PersistenceAdapter {
   getLocal(key: string): Promise<Uint8Array | undefined>;
   setLocal(key: string, value: Uint8Array): Promise<void>;
