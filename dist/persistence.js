@@ -8,6 +8,24 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
     });
 };
 import { get, set, del } from "idb-keyval";
+export const PERSISTENCE_META_SUFFIX = "#meta";
+export function persistenceMetaKey(documentPath) {
+    return `${documentPath}${PERSISTENCE_META_SUFFIX}`;
+}
+export function encodeEpochMeta(epoch) {
+    return new TextEncoder().encode(JSON.stringify({ epoch }));
+}
+export function decodeEpochMeta(bytes) {
+    if (!bytes || bytes.byteLength === 0)
+        return 0;
+    try {
+        const parsed = JSON.parse(new TextDecoder().decode(bytes));
+        return typeof parsed.epoch === "number" ? parsed.epoch : 0;
+    }
+    catch (_a) {
+        return 0;
+    }
+}
 export const idbKeyvalAdapter = {
     getLocal: (key) => get(key),
     setLocal: (key, value) => set(key, value),

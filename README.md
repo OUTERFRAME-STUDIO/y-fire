@@ -9,7 +9,7 @@ https://github.com/podraven/y-fire/assets/2324523/3aa27a40-6cfb-4b93-b043-4e0fa5
 # Features
 
 1. Utilizes a peer-to-peer network to exchange real-time data and awareness.
-2. Utilizes Firestore as persistent storage and syncs with Firestore periodically to maintain persistent data state. Writes are a **transactional Yjs union** (re-read `content`, `Y.applyUpdate` remote + local, write the merged update). `{ merge: true }` only merges Firestore *fields* — it does not merge CRDT state by itself.
+2. Utilizes Firestore as persistent storage and syncs with Firestore periodically to maintain persistent data state. Each shard document stores a compacted Yjs **snapshot** in `content` plus an append-only `updates/*` subcollection of small deltas. A flush writes one small update document (do not flush per keystroke — the existing debounce still applies). A **fold** rewrites `content` to the union of the snapshot, the update docs that were read, and local state, then deletes only those read ids. Fold does **not** bump `contentGeneration` (the epoch): a fold snapshot is a strict superset, so peers apply it as a normal Yjs update. The epoch is reserved for compact/replace, where the new bytes are not a superset. `{ merge: true }` only merges Firestore *fields* — it does not merge CRDT state by itself. Applying `updates/*` in any order converges (`Y.applyUpdate` buffers missing deps); `seq` is for fold windows and debugging only.
 3. Utilizes Firestore as a peer discovery platform. Once peers are connected to each other, real-time updates are shared without accessing Firestore, thus reducing costs.
 4. Instead of connecting all peers to each other, y-fire creates clusters of clients. Clients within a cluster are connected to each other, and clusters are connected to each other through one common client. If clients leave or new clients join, clusters are recreated. Limiting client connections to limited number of peers thus improves performance. (Discussion: [WebRTC: peer connections limit](https://stackoverflow.com/questions/16015304/webrtc-peer-connections-limit))
 5. You can set wait times and thresholds.
@@ -63,7 +63,11 @@ provider.onReady = () => {
   // cache or server snapshot exists
 };
 provider.onServerReady = () => {
-  // safe to seed / flush; server snapshot (or confirmed-missing doc) applied
+  // safe to seed / flush; both the shard doc and the updates collection
+  // have delivered a server (non-cache) snapshot
+};
+provider.onEpochReplace = ({ from, to }) => {
+  // compact/replace landed; remount a fresh Y.Doc instead of unioning
 };
 provider.onDeleted = () => {
   // do something
@@ -99,9 +103,31 @@ const editor = new Editor({
 })
 ```
 
+# Firestore layout
+
+```
+{documentPath}                         // e.g. projects/{pid}/shards/{docId}
+  content            Bytes             // compacted snapshot
+  contentGeneration  number            // epoch; bumped ONLY on replacement
+  snapshotSV         Bytes             // state vector of `content`
+  updatedAt          timestamp
+{documentPath}/updates/{autoId}
+  update             Bytes             // Y.encodeStateAsUpdate(doc, lastPersistedSV)
+  seq                number            // debug / fold window only
+  clientId           string
+  createdAt          timestamp
+{documentPath}/instances/*             // WebRTC signaling, unchanged
+```
+
+Hydrate = apply `content`, then every `updates/*` doc (order-independent). The first write on a shard with no `content` writes the snapshot directly so older readers keep working. After that, each debounced flush appends one update document. When `updates` count ≥ `foldUpdateThreshold` (default 20) or total update bytes ≥ `foldBytesFraction` of the 1 MiB cap (default 0.5), the client folds: `getDocs(updates)` outside the transaction, then a transaction writes `content = union(server content, local doc, read update bytes)` and deletes **only** the ids that were read. Concurrent appends that land during the fold are left in place and replay harmlessly. Empty deltas are skipped; a delta or folded snapshot above 1 MiB is aborted (fold abort keeps the update docs so appends can continue).
+
+`serverReady` requires **both** the shard-document listener **and** the `updates` collection listener to have delivered a non-cache snapshot, so a flush cannot append before remote deltas are known.
+
+IndexedDB keeps the full local snapshot at `documentPath` plus a sibling `{documentPath}#meta` record holding the epoch. After a replacement that happened while the tab was closed, the stale local copy is dropped instead of unioned.
+
 # Firestore rules
 
-You need to grant **read and write** permissions to the document `/path/to/your/document` and its children `/path/to/your/document/{document=**}` for this module to function properly. y-fire will write (merge) to the `content` field of your document, which corresponds to your Yjs data. Additionally, y-fire creates collections and documents within the specified document path for peer discovery purposes.
+You need to grant **read and write** permissions to the document `/path/to/your/document` and its children `/path/to/your/document/{document=**}` for this module to function properly. y-fire reads and writes the `content` / `contentGeneration` / `snapshotSV` fields and the `updates/*` subcollection, and creates `instances/*` documents for peer discovery. Editors must be allowed to create and delete `updates/*` documents (append + fold).
 
 # APIs
 
@@ -114,6 +140,9 @@ You need to grant **read and write** permissions to the document `/path/to/your/
 - **maxUpdatesThreshold**: Number of updates before triggering real-time data share, defaults to 20
 - **maxWaitTime**: Time in milliseconds before triggering real-time data share, defaults to 100
 - **maxWaitFirestoreTime**: Time in milliseconds before triggering persistent data sync to Firestore, defaults to 3000
+- **foldUpdateThreshold**: Number of `updates/*` docs before folding them into `content`, defaults to 20
+- **foldBytesFraction**: Fold when total update bytes reach this fraction of the content cap, defaults to 0.5
+- **epochField**: Firestore field used as the replacement epoch, defaults to `contentGeneration`
 
 Example:
 
@@ -150,11 +179,12 @@ new FireProvider({
 #### Events
 
 - **onReady**: Triggered after the first snapshot in which the Firestore document `exists()` (may be the persistent cache).
-- **onServerReady**: Triggered once a snapshot with `metadata.fromCache === false` has been applied (server confirmation, including a confirmed-missing document). IndexedDB `syncLocal` and hide/unload flushes wait for this.
+- **onServerReady**: Triggered once **both** the shard document and the `updates` collection have delivered a snapshot with `metadata.fromCache === false` (server confirmation, including a confirmed-missing document / empty updates collection). IndexedDB `syncLocal` and hide/unload flushes wait for this.
+- **onEpochReplace**: Triggered when `contentGeneration` (or `epochField`) on the shard document is higher than the epoch this provider hydrated with. The new `content` is **not** applied (it is not a superset). The provider stops writing, drops IndexedDB, and the host should remount a fresh `Y.Doc`. Equal or absent epoch → apply `content` as a normal Yjs update.
 - **onDeleted**: Triggered if the instance was deleted (e.g., no permission to read/write the document).
 - **onSaving**: Triggered when the sync to Firestore is in process (e.g., you may want to alert users not to close the window). `onSaving(false)` runs only after a **successful** write.
-- **onSaveError**: Triggered when a merge-write fails or encoded `content` exceeds 1 MiB (`reason`: `save-failed` | `size-abort`). The UI should treat this as unsaved; y-fire retries failed network writes and never falls back to last-write-wins `setDoc`.
-- **onSaveWarning**: Triggered when encoded `content` is ≥ 70% of 1 MiB (`size-warn`) or the local replica is missing structs already on the server (`shrink`). The write still proceeds (union) unless size-abort.
+- **onSaveError**: Triggered when an append/snapshot write fails or encoded delta/snapshot exceeds 1 MiB (`reason`: `save-failed` | `size-abort`). The UI should treat this as unsaved; y-fire retries failed network writes and never falls back to last-write-wins `setDoc`.
+- **onSaveWarning**: Triggered when encoded `content` or a delta is ≥ 70% of 1 MiB (`size-warn`), or a fold snapshot exceeds the cap (`size-abort` — the append itself already succeeded and update docs are kept).
 
 Example:
 

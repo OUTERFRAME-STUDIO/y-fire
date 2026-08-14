@@ -23,11 +23,11 @@ describe("snapshot auto-reconnect", () => {
     emitSnapshotError(TEST_PATH, { code: "unavailable" });
 
     await vi.advanceTimersByTimeAsync(500);
-    expect(onSnapshotCallCount).toBe(initialCalls + 1);
+    expect(onSnapshotCallCount).toBe(initialCalls + 2);
 
     emitSnapshotError(TEST_PATH, { code: "unavailable" });
     await vi.advanceTimersByTimeAsync(1000);
-    expect(onSnapshotCallCount).toBe(initialCalls + 2);
+    expect(onSnapshotCallCount).toBe(initialCalls + 4);
 
     void provider;
   });
