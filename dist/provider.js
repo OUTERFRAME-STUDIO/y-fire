@@ -21,6 +21,8 @@ import { mergeStateVectors, stateVectorCovers, stateVectorFromUpdate } from "./s
 const SNAPSHOT_BACKOFF_BASE_MS = 500;
 const SNAPSHOT_BACKOFF_MAX_MS = 16000;
 const FOLD_BACKOFF_MS = 30000;
+/** Trailing debounce for full-doc IndexedDB encodes after local updates. */
+export const LOCAL_PERSIST_DEBOUNCE_MS = 500;
 /**
  * FireProvider class that handles firestore data sync and awareness
  * based on webRTC.
@@ -51,6 +53,12 @@ export class FireProvider extends ObservableV2 {
             destroy: { get: () => super.destroy }
         });
         return __awaiter(this, void 0, void 0, function* () {
+            try {
+                yield this.flushSaveToLocal();
+            }
+            catch (error) {
+                this.consoleHandler("kill: local persist error", error);
+            }
             if (this.serverReady && (this.firestoreTimeout || this.cache)) {
                 try {
                     yield this.saveToFirestore();
@@ -76,6 +84,8 @@ export class FireProvider extends ObservableV2 {
                 clearTimeout(this.meshRetryTimeout);
             if (this.saveRetryTimeout)
                 clearTimeout(this.saveRetryTimeout);
+            if (this.localPersistTimeout)
+                clearTimeout(this.localPersistTimeout);
             this.doc.off("update", this.updateHandler);
             this.awareness.off("update", this.awarenessUpdateHandler);
             deleteInstance(this.db, this.documentPath, this.uid);
@@ -200,6 +210,25 @@ export class FireProvider extends ObservableV2 {
             catch (e) {
                 this.consoleHandler("set local error", e);
             }
+        });
+        this.scheduleSaveToLocal = () => {
+            if (this.persistenceMode === "none")
+                return;
+            if (this.localPersistTimeout)
+                clearTimeout(this.localPersistTimeout);
+            this.localPersistTimeout = setTimeout(() => {
+                this.localPersistTimeout = undefined;
+                void this.saveToLocal();
+            }, LOCAL_PERSIST_DEBOUNCE_MS);
+        };
+        this.flushSaveToLocal = () => __awaiter(this, void 0, void 0, function* () {
+            if (this.localPersistTimeout) {
+                clearTimeout(this.localPersistTimeout);
+                this.localPersistTimeout = undefined;
+            }
+            if (this.persistenceMode === "none")
+                return;
+            yield this.saveToLocal();
         });
         this.deleteLocal = () => __awaiter(this, void 0, void 0, function* () {
             try {
@@ -522,6 +551,7 @@ export class FireProvider extends ObservableV2 {
             }, this.maxFirestoreWait);
         };
         this.saveToFirestore = () => __awaiter(this, void 0, void 0, function* () {
+            yield this.flushSaveToLocal();
             if (!this.serverReady || this.epochReplaced) {
                 return;
             }
@@ -601,6 +631,8 @@ export class FireProvider extends ObservableV2 {
                 this.onSaveWarning(this.saveContext(fold.byteLength, "size-warn"));
             }
             Y.applyUpdate(this.doc, fold.snapshot, "origin:firebase/update");
+            // Persist the written snapshot's SV, not the live doc: concurrent local
+            // edits during the fold await must remain unpersisted for the next append.
             this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, stateVectorFromUpdate(fold.snapshot));
             for (const item of listed) {
                 this.appliedUpdateIds.delete(item.id);
@@ -629,6 +661,7 @@ export class FireProvider extends ObservableV2 {
             this.applyFoldSuccess(fold, listed);
         });
         this.writeFirstSnapshot = (localUpdate) => __awaiter(this, void 0, void 0, function* () {
+            const svAtEncode = Y.encodeStateVector(this.doc);
             const kind = contentSizeKind(localUpdate.byteLength, this.maxContentBytes);
             if (kind === "abort") {
                 this.abortSize(localUpdate.byteLength, "y-fire: encoded content exceeds Firestore 1 MiB limit");
@@ -648,13 +681,14 @@ export class FireProvider extends ObservableV2 {
                 return;
             }
             this.hasRemoteContent = true;
-            this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, stateVectorFromUpdate(localUpdate));
+            this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, svAtEncode);
         });
         this.appendDelta = (localUpdate) => __awaiter(this, void 0, void 0, function* () {
             if (this.updatesAccessDenied) {
                 yield this.writeForcedSnapshot(localUpdate);
                 return;
             }
+            const svAtEncode = Y.encodeStateVector(this.doc);
             const delta = Y.encodeStateAsUpdate(this.doc, this.lastPersistedSV);
             if (delta.byteLength <= EMPTY_YJS_UPDATE_MAX_BYTES) {
                 return;
@@ -673,7 +707,7 @@ export class FireProvider extends ObservableV2 {
             this.lastSeq = seq;
             if (result === null || result === void 0 ? void 0 : result.id)
                 this.appliedUpdateIds.add(result.id);
-            this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, stateVectorFromUpdate(delta));
+            this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, svAtEncode);
             yield this.maybeFold(localUpdate);
         });
         this.maybeFold = (localUpdate) => __awaiter(this, void 0, void 0, function* () {
@@ -789,7 +823,7 @@ export class FireProvider extends ObservableV2 {
                     from: typeof origin === "string" ? origin : this.uid,
                     update,
                 });
-                this.saveToLocal(); // save data to local indexedDb
+                this.scheduleSaveToLocal();
             }
         };
         this.awarenessUpdateHandler = ({ added, updated, removed, }, origin) => {
@@ -801,11 +835,15 @@ export class FireProvider extends ObservableV2 {
             });
         };
         this.flushOnHide = () => {
-            if (!this.serverReady)
+            if (!this.serverReady) {
+                void this.flushSaveToLocal();
                 return;
+            }
             if (this.firestoreTimeout || this.cache) {
                 void this.saveToFirestore();
+                return;
             }
+            void this.flushSaveToLocal();
         };
         this.onVisibilityChange = () => {
             if (document.visibilityState === "hidden") {

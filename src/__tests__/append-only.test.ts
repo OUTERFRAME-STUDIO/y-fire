@@ -51,6 +51,14 @@ function sequentialPayload(): {
   return { control, snapshot, updates: [u1, u2, u3], text: "Hello World!" };
 }
 
+function nonSkipStructKeys(update: Uint8Array): Set<string> {
+  return new Set(
+    Y.decodeUpdate(update)
+      .structs.filter((s) => !(s instanceof Y.Skip))
+      .map((s) => `${s.id.client}:${s.id.clock}:${s.length}`),
+  );
+}
+
 describe("append-only persistence", () => {
   let provider: FireProvider | undefined;
 
@@ -153,6 +161,66 @@ describe("append-only persistence", () => {
     const payload = setDocCalls[0]?.data as { snapshotSV?: unknown; contentGeneration?: number };
     expect(payload.snapshotSV).toBeDefined();
     expect(payload.contentGeneration).toBeUndefined();
+  });
+
+  it("second local append is a small delta and does not re-send the first edit", async () => {
+    const created = await createTestProvider();
+    provider = created.provider;
+    await markServerReady(TEST_PATH);
+
+    created.ydoc.getText("t").insert(0, "snapshot-base");
+    await provider.saveToFirestore();
+    expect(setDocCalls.length).toBe(1);
+    expect(addDocCalls.length).toBe(0);
+
+    created.ydoc.getText("t").insert(13, "A".repeat(2000));
+    await provider.saveToFirestore();
+    expect(addDocCalls.length).toBe(1);
+    const firstDelta = decodeUpdateBytes(addDocCalls[0]?.data);
+
+    created.ydoc.getText("t").insert(2013, "B");
+    await provider.saveToFirestore();
+    expect(addDocCalls.length).toBe(2);
+    const secondDelta = decodeUpdateBytes(addDocCalls[1]?.data);
+
+    expect(secondDelta.byteLength).toBeLessThan(firstDelta.byteLength / 10);
+    const firstKeys = nonSkipStructKeys(firstDelta);
+    const secondKeys = nonSkipStructKeys(secondDelta);
+    for (const key of firstKeys) {
+      expect(secondKeys.has(key)).toBe(false);
+    }
+  });
+
+  it("local append after a remote updates-listener apply does not re-send remote structs", async () => {
+    const remote = new Y.Doc();
+    remote.getText("t").insert(0, "base");
+    const snapshot = Y.encodeStateAsUpdate(remote);
+    const sv = Y.encodeStateVector(remote);
+    remote.getText("t").insert(4, "R".repeat(2000));
+    const remoteDelta = Y.encodeStateAsUpdate(remote, sv);
+
+    const created = await createTestProvider();
+    provider = created.provider;
+    emitServerUpdate(TEST_PATH, snapshot);
+    await flushMicrotasks();
+
+    seedFirestoreUpdate(TEST_PATH, "remote-u1", remoteDelta, { seq: 1 });
+    emitUpdatesSnapshot(TEST_PATH);
+    await flushMicrotasks();
+    expect(created.ydoc.getText("t").toString()).toContain("RRR");
+
+    created.ydoc.getText("t").insert(created.ydoc.getText("t").length, "L");
+    await provider.saveToFirestore();
+
+    expect(addDocCalls.length).toBe(1);
+    const localDelta = decodeUpdateBytes(addDocCalls[0]?.data);
+    expect(localDelta.byteLength).toBeLessThan(remoteDelta.byteLength / 10);
+
+    const remoteKeys = nonSkipStructKeys(remoteDelta);
+    const localKeys = nonSkipStructKeys(localDelta);
+    for (const key of remoteKeys) {
+      expect(localKeys.has(key)).toBe(false);
+    }
   });
 
   it("skips an empty delta append", async () => {

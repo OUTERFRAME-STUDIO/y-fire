@@ -47,6 +47,8 @@ interface PeersRTC {
         [key: string]: WebRtc;
     };
 }
+/** Trailing debounce for full-doc IndexedDB encodes after local updates. */
+export declare const LOCAL_PERSIST_DEBOUNCE_MS = 500;
 /**
  * FireProvider class that handles firestore data sync and awareness
  * based on webRTC.
@@ -92,6 +94,7 @@ export declare class FireProvider extends ObservableV2<any> {
     private snapshotRetryTimeout?;
     private meshRetryTimeout?;
     private saveRetryTimeout?;
+    private localPersistTimeout?;
     private dataListenerPaused;
     private pendingSyncLocal;
     private lastPersistedSV?;
@@ -126,6 +129,8 @@ export declare class FireProvider extends ObservableV2<any> {
     init: () => Promise<void>;
     syncLocal: () => Promise<void>;
     saveToLocal: () => Promise<void>;
+    private scheduleSaveToLocal;
+    flushSaveToLocal: () => Promise<void>;
     deleteLocal: () => Promise<void>;
     initiateHandler: () => void;
     private scheduleSnapshotRetry;
