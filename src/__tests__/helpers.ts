@@ -61,13 +61,13 @@ export async function createTestProvider(
   resetFirestoreMock();
   resetIdbMock();
 
-  const ydoc = new Y.Doc();
+  const ydoc = overrides.ydoc ?? new Y.Doc();
   const provider = new FireProvider({
     firebaseApp: {} as FirebaseApp,
-    ydoc,
     path: TEST_PATH,
     maxWaitTime: 10,
     ...overrides,
+    ydoc,
   });
 
   await flushMicrotasks();

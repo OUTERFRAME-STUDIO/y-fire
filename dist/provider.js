@@ -17,9 +17,10 @@ import { createGraph } from "./graph";
 import { createPersistenceAdapter, decodeEpochMeta, encodeEpochMeta, persistenceMetaKey, } from "./persistence";
 import { EMPTY_YJS_UPDATE_MAX_BYTES, FIRESTORE_CONTENT_MAX_BYTES, contentSizeKind, } from "./firestore-limits";
 import { appendUpdate, DEFAULT_EPOCH_FIELD, DEFAULT_FOLD_BYTES_FRACTION, DEFAULT_FOLD_UPDATE_THRESHOLD, foldUpdates, listUpdates, readBytes, readSnapshotMeta, updatesCollectionPath, writeSnapshot, } from "./append-store";
-import { mergeStateVectors, stateVectorFromUpdate } from "./state-vector";
+import { mergeStateVectors, stateVectorCovers, stateVectorFromUpdate } from "./state-vector";
 const SNAPSHOT_BACKOFF_BASE_MS = 500;
 const SNAPSHOT_BACKOFF_MAX_MS = 16000;
+const FOLD_BACKOFF_MS = 30000;
 /**
  * FireProvider class that handles firestore data sync and awareness
  * based on webRTC.
@@ -132,6 +133,11 @@ export class FireProvider extends ObservableV2 {
         this.foldUpdateThreshold = DEFAULT_FOLD_UPDATE_THRESHOLD;
         this.foldBytesFraction = DEFAULT_FOLD_BYTES_FRACTION;
         this.epochField = DEFAULT_EPOCH_FIELD;
+        this.updateDocCount = 0;
+        this.updateTotalBytes = 0;
+        this.foldAbortReported = false;
+        this.updatesAccessDenied = false;
+        this.updatesDeniedWarned = false;
         this.ready = false;
         this.serverReady = false;
         this.init = () => __awaiter(this, void 0, void 0, function* () {
@@ -236,7 +242,9 @@ export class FireProvider extends ObservableV2 {
         this.maybeBecomeServerReady = () => {
             if (this.serverReady)
                 return;
-            if (!this.docServerSnapshot || !this.updatesServerSnapshot)
+            if (!this.docServerSnapshot)
+                return;
+            if (!this.updatesServerSnapshot && !this.updatesAccessDenied)
                 return;
             this.serverReady = true;
             if (this.onServerReady)
@@ -281,9 +289,14 @@ export class FireProvider extends ObservableV2 {
                     else {
                         if (meta.content) {
                             this.hasRemoteContent = true;
-                            this.firebaseDataLastUpdatedAt = new Date().getTime();
-                            Y.applyUpdate(this.doc, meta.content, "origin:firebase/update");
-                            this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, (_b = meta.snapshotSV) !== null && _b !== void 0 ? _b : stateVectorFromUpdate(meta.content));
+                            const skipApply = !!meta.snapshotSV &&
+                                stateVectorCovers(this.lastPersistedSV, meta.snapshotSV);
+                            if (!skipApply) {
+                                this.clearFoldBackoff();
+                                this.firebaseDataLastUpdatedAt = new Date().getTime();
+                                Y.applyUpdate(this.doc, meta.content, "origin:firebase/update");
+                                this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, (_b = meta.snapshotSV) !== null && _b !== void 0 ? _b : stateVectorFromUpdate(meta.content));
+                            }
                         }
                         this.hydratedEpoch = meta.epoch;
                     }
@@ -311,13 +324,18 @@ export class FireProvider extends ObservableV2 {
                 var _a;
                 this.snapshotRetryAttempt = 0;
                 const fromCache = ((_a = snap.metadata) === null || _a === void 0 ? void 0 : _a.fromCache) === true;
+                this.updatesAccessDenied = false;
+                this.updateDocCount = 0;
+                this.updateTotalBytes = 0;
                 if (!this.epochReplaced && typeof snap.forEach === "function") {
                     snap.forEach((d) => {
-                        if (this.appliedUpdateIds.has(d.id))
-                            return;
                         const data = (typeof d.data === "function" ? d.data() : undefined);
                         const bytes = readBytes(data === null || data === void 0 ? void 0 : data.update);
                         if (!bytes)
+                            return;
+                        this.updateDocCount++;
+                        this.updateTotalBytes += bytes.byteLength;
+                        if (this.appliedUpdateIds.has(d.id))
                             return;
                         this.appliedUpdateIds.add(d.id);
                         if (typeof (data === null || data === void 0 ? void 0 : data.seq) === "number" && data.seq > this.lastSeq) {
@@ -333,8 +351,12 @@ export class FireProvider extends ObservableV2 {
             }, (error) => {
                 this.consoleHandler("Firestore updates sync error", error);
                 if (error.code === "permission-denied") {
-                    if (this.onDeleted)
-                        this.onDeleted();
+                    this.updatesAccessDenied = true;
+                    if (!this.updatesDeniedWarned) {
+                        this.updatesDeniedWarned = true;
+                        this.consoleHandler("Updates collection permission-denied; writing full snapshots until access is restored");
+                    }
+                    this.maybeBecomeServerReady();
                     return;
                 }
                 this.scheduleSnapshotRetry();
@@ -525,7 +547,7 @@ export class FireProvider extends ObservableV2 {
                 const reason = error && typeof error === "object" && "reason" in error
                     ? error.reason
                     : undefined;
-                if (reason === "size-abort") {
+                if (reason === "size-abort" || reason === "compact-required") {
                     return;
                 }
                 const code = error && typeof error === "object" && "code" in error
@@ -546,6 +568,66 @@ export class FireProvider extends ObservableV2 {
             }
             throw err;
         };
+        this.clearFoldBackoff = () => {
+            this.foldBackoffUntil = undefined;
+            this.foldAbortedAtSnapshotSV = undefined;
+            this.foldAbortReported = false;
+        };
+        this.beginFoldBackoff = () => {
+            this.foldBackoffUntil = Date.now() + FOLD_BACKOFF_MS;
+            this.foldAbortedAtSnapshotSV = this.lastPersistedSV;
+        };
+        this.shouldSkipFold = () => {
+            if (this.foldBackoffUntil === undefined)
+                return false;
+            if (Date.now() >= this.foldBackoffUntil) {
+                this.foldBackoffUntil = undefined;
+                return false;
+            }
+            return true;
+        };
+        this.emitCompactRequired = (byteLength) => {
+            const err = Object.assign(new Error("y-fire: snapshot exceeds Firestore 1 MiB limit; compact required"), { reason: "compact-required" });
+            if (!this.foldAbortReported) {
+                this.foldAbortReported = true;
+                if (this.onSaveError) {
+                    this.onSaveError(err, this.saveContext(byteLength, "compact-required"));
+                }
+            }
+            return err;
+        };
+        this.applyFoldSuccess = (fold, listed) => {
+            if (fold.kind === "warn" && this.onSaveWarning) {
+                this.onSaveWarning(this.saveContext(fold.byteLength, "size-warn"));
+            }
+            Y.applyUpdate(this.doc, fold.snapshot, "origin:firebase/update");
+            this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, stateVectorFromUpdate(fold.snapshot));
+            for (const item of listed) {
+                this.appliedUpdateIds.delete(item.id);
+            }
+            this.clearFoldBackoff();
+        };
+        this.writeForcedSnapshot = (localUpdate) => __awaiter(this, void 0, void 0, function* () {
+            const listed = this.updatesAccessDenied
+                ? []
+                : yield listUpdates(this.db, this.documentPath);
+            const fold = yield foldUpdates({
+                db: this.db,
+                documentPath: this.documentPath,
+                listed,
+                localUpdate,
+                documentMapper: this.documentMapper,
+                maxContentBytes: this.maxContentBytes,
+                force: true,
+            });
+            if (fold.status === "abort") {
+                this.beginFoldBackoff();
+                throw this.emitCompactRequired(fold.byteLength);
+            }
+            if (fold.status !== "ok")
+                return;
+            this.applyFoldSuccess(fold, listed);
+        });
         this.writeFirstSnapshot = (localUpdate) => __awaiter(this, void 0, void 0, function* () {
             const kind = contentSizeKind(localUpdate.byteLength, this.maxContentBytes);
             if (kind === "abort") {
@@ -569,16 +651,18 @@ export class FireProvider extends ObservableV2 {
             this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, stateVectorFromUpdate(localUpdate));
         });
         this.appendDelta = (localUpdate) => __awaiter(this, void 0, void 0, function* () {
+            if (this.updatesAccessDenied) {
+                yield this.writeForcedSnapshot(localUpdate);
+                return;
+            }
             const delta = Y.encodeStateAsUpdate(this.doc, this.lastPersistedSV);
             if (delta.byteLength <= EMPTY_YJS_UPDATE_MAX_BYTES) {
                 return;
             }
             const kind = contentSizeKind(delta.byteLength, this.maxContentBytes);
             if (kind === "abort") {
-                this.abortSize(delta.byteLength, "y-fire: encoded delta exceeds Firestore 1 MiB limit");
-            }
-            if (kind === "warn" && this.onSaveWarning) {
-                this.onSaveWarning(this.saveContext(delta.byteLength, "size-warn"));
+                yield this.writeForcedSnapshot(localUpdate);
+                return;
             }
             const seq = this.lastSeq + 1;
             const result = yield appendUpdate(this.db, this.documentPath, {
@@ -593,14 +677,15 @@ export class FireProvider extends ObservableV2 {
             yield this.maybeFold(localUpdate);
         });
         this.maybeFold = (localUpdate) => __awaiter(this, void 0, void 0, function* () {
+            if (this.shouldSkipFold())
+                return;
+            const bytesThreshold = Math.floor(this.maxContentBytes * this.foldBytesFraction);
+            if (this.updateDocCount < this.foldUpdateThreshold &&
+                this.updateTotalBytes < bytesThreshold) {
+                return;
+            }
             try {
                 const listed = yield listUpdates(this.db, this.documentPath);
-                const totalBytes = listed.reduce((sum, item) => sum + item.update.byteLength, 0);
-                const bytesThreshold = Math.floor(this.maxContentBytes * this.foldBytesFraction);
-                if (listed.length < this.foldUpdateThreshold &&
-                    totalBytes < bytesThreshold) {
-                    return;
-                }
                 const fold = yield foldUpdates({
                     db: this.db,
                     documentPath: this.documentPath,
@@ -610,21 +695,13 @@ export class FireProvider extends ObservableV2 {
                     maxContentBytes: this.maxContentBytes,
                 });
                 if (fold.status === "abort") {
-                    if (this.onSaveWarning) {
-                        this.onSaveWarning(this.saveContext(fold.byteLength, "size-abort"));
-                    }
+                    this.beginFoldBackoff();
+                    this.emitCompactRequired(fold.byteLength);
                     return;
                 }
                 if (fold.status !== "ok")
                     return;
-                if (fold.kind === "warn" && this.onSaveWarning) {
-                    this.onSaveWarning(this.saveContext(fold.byteLength, "size-warn"));
-                }
-                Y.applyUpdate(this.doc, fold.snapshot, "origin:firebase/update");
-                this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, stateVectorFromUpdate(fold.snapshot));
-                for (const item of listed) {
-                    this.appliedUpdateIds.delete(item.id);
-                }
+                this.applyFoldSuccess(fold, listed);
             }
             catch (error) {
                 this.consoleHandler("foldUpdates error", error);

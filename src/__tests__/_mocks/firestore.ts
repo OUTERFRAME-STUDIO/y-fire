@@ -116,6 +116,37 @@ function wrapBytes(content: Uint8Array) {
   return { toUint8Array: () => content };
 }
 
+/** Mirrors Firestore: undefined field values are rejected. */
+export function assertNoUndefinedFields(
+  value: unknown,
+  fieldPath = "",
+): void {
+  if (value === undefined) {
+    throw new Error(
+      `Unsupported field value: undefined (found in field ${fieldPath || "(root)"})`,
+    );
+  }
+  if (value === null || typeof value !== "object") return;
+  if (typeof (value as { toUint8Array?: unknown }).toUint8Array === "function") {
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item, i) => {
+      assertNoUndefinedFields(item, fieldPath ? `${fieldPath}[${i}]` : `[${i}]`);
+    });
+    return;
+  }
+  for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+    const next = fieldPath ? `${fieldPath}.${key}` : key;
+    if (nested === undefined) {
+      throw new Error(
+        `Unsupported field value: undefined (found in field ${next})`,
+      );
+    }
+    assertNoUndefinedFields(nested, next);
+  }
+}
+
 export function seedFirestoreContent(path: string, content: Uint8Array) {
   const existing = firestoreDocs.get(path) ?? {};
   firestoreDocs.set(path, {
@@ -253,6 +284,7 @@ export const onSnapshot = vi.fn(
 );
 
 export const setDoc = vi.fn(async (ref: MockRef, data: unknown, options?: unknown) => {
+  assertNoUndefinedFields(data);
   setDocCalls.push({ ref, data, options });
   const existing = firestoreDocs.get(ref.path) ?? {};
   const incoming = (data ?? {}) as Record<string, unknown>;
@@ -269,6 +301,7 @@ export const addDoc = vi.fn(async (ref: MockRef, data: unknown) => {
   if (addDocShouldFail) {
     throw addDocShouldFail;
   }
+  assertNoUndefinedFields(data);
   const id = `auto_${++autoIdCounter}`;
   const col = getOrCreateCollection(ref.path);
   col.set(id, (data ?? {}) as Record<string, unknown>);
@@ -321,6 +354,7 @@ export const runTransaction = vi.fn(
         };
       },
       set: (ref, data, options) => {
+        assertNoUndefinedFields(data);
         setDocCalls.push({ ref, data, options });
         const existing = firestoreDocs.get(ref.path) ?? {};
         const incoming = (data ?? {}) as Record<string, unknown>;

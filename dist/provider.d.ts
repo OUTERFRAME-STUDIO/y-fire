@@ -6,7 +6,7 @@ import { ObservableV2 } from "lib0/observable";
 import * as awarenessProtocol from "y-protocols/awareness";
 import { WebRtc } from "./webrtc";
 import { PersistenceMode } from "./persistence";
-export type FireSaveReason = "save-failed" | "size-abort" | "size-warn" | "shrink";
+export type FireSaveReason = "save-failed" | "size-abort" | "size-warn" | "shrink" | "compact-required";
 export interface FireSaveContext {
     documentPath: string;
     byteLength: number;
@@ -106,6 +106,13 @@ export declare class FireProvider extends ObservableV2<any> {
     private foldUpdateThreshold;
     private foldBytesFraction;
     private epochField;
+    private updateDocCount;
+    private updateTotalBytes;
+    private foldBackoffUntil?;
+    private foldAbortedAtSnapshotSV?;
+    private foldAbortReported;
+    private updatesAccessDenied;
+    private updatesDeniedWarned;
     get clientTimeOffset(): number;
     ready: boolean;
     serverReady: boolean;
@@ -139,6 +146,12 @@ export declare class FireProvider extends ObservableV2<any> {
     private scheduleSaveRetry;
     saveToFirestore: () => Promise<void>;
     private abortSize;
+    private clearFoldBackoff;
+    private beginFoldBackoff;
+    private shouldSkipFold;
+    private emitCompactRequired;
+    private applyFoldSuccess;
+    private writeForcedSnapshot;
     private writeFirstSnapshot;
     private appendDelta;
     private maybeFold;

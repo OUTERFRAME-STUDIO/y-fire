@@ -63,8 +63,8 @@ provider.onReady = () => {
   // cache or server snapshot exists
 };
 provider.onServerReady = () => {
-  // safe to seed / flush; both the shard doc and the updates collection
-  // have delivered a server (non-cache) snapshot
+  // safe to seed / flush; the shard doc has a server snapshot, and either
+  // the updates collection has too or updates/ access was denied (degraded)
 };
 provider.onEpochReplace = ({ from, to }) => {
   // compact/replace landed; remount a fresh Y.Doc instead of unioning
@@ -114,14 +114,14 @@ const editor = new Editor({
 {documentPath}/updates/{autoId}
   update             Bytes             // Y.encodeStateAsUpdate(doc, lastPersistedSV)
   seq                number            // debug / fold window only
-  clientId           string
+  clientId           string?           // omitted when the WebRTC uid is not yet known
   createdAt          timestamp
 {documentPath}/instances/*             // WebRTC signaling, unchanged
 ```
 
-Hydrate = apply `content`, then every `updates/*` doc (order-independent). The first write on a shard with no `content` writes the snapshot directly so older readers keep working. After that, each debounced flush appends one update document. When `updates` count ≥ `foldUpdateThreshold` (default 20) or total update bytes ≥ `foldBytesFraction` of the 1 MiB cap (default 0.5), the client folds: `getDocs(updates)` outside the transaction, then a transaction writes `content = union(server content, local doc, read update bytes)` and deletes **only** the ids that were read. Concurrent appends that land during the fold are left in place and replay harmlessly. Empty deltas are skipped; a delta or folded snapshot above 1 MiB is aborted (fold abort keeps the update docs so appends can continue).
+Hydrate = apply `content`, then every `updates/*` doc (order-independent). The first write on a shard with no `content` writes the snapshot directly so older readers keep working. After that, each debounced flush appends one update document. Fold **decision** uses the live `updates` listener (doc count and total bytes) — a normal append does not `getDocs` the collection. When count ≥ `foldUpdateThreshold` (default 20) or total update bytes ≥ `foldBytesFraction` of the 1 MiB cap (default 0.5), the client folds: `getDocs(updates)` only for that fold, then a transaction writes `content = union(server content, local doc, read update bytes)` and deletes **only** the ids that were read. Concurrent appends that land during the fold are left in place and replay harmlessly. Empty deltas are skipped. A delta above 1 MiB does **not** abort: the client force-folds a union snapshot instead (including when `updates/` is empty). If that union also exceeds 1 MiB, the provider reports `compact-required` once, backs off further fold attempts (appends keep flowing), and the shard needs DEV-66 compaction. `size-warn` (≥ 70% of the cap) applies to snapshot and fold writes only, not to a large-but-under-cap delta.
 
-`serverReady` requires **both** the shard-document listener **and** the `updates` collection listener to have delivered a non-cache snapshot, so a flush cannot append before remote deltas are known.
+`serverReady` normally waits until **both** the shard-document listener **and** the `updates` collection listener have delivered a non-cache snapshot, so a flush cannot append before remote deltas are known. If the `updates` listener is `permission-denied`, the provider does **not** treat the shard as deleted: it reaches `serverReady` from the document listener alone, warns once, and degrades to full-snapshot writes until `updates/` is readable again.
 
 IndexedDB keeps the full local snapshot at `documentPath` plus a sibling `{documentPath}#meta` record holding the epoch. After a replacement that happened while the tab was closed, the stale local copy is dropped instead of unioned.
 
@@ -179,12 +179,12 @@ new FireProvider({
 #### Events
 
 - **onReady**: Triggered after the first snapshot in which the Firestore document `exists()` (may be the persistent cache).
-- **onServerReady**: Triggered once **both** the shard document and the `updates` collection have delivered a snapshot with `metadata.fromCache === false` (server confirmation, including a confirmed-missing document / empty updates collection). IndexedDB `syncLocal` and hide/unload flushes wait for this.
-- **onEpochReplace**: Triggered when `contentGeneration` (or `epochField`) on the shard document is higher than the epoch this provider hydrated with. The new `content` is **not** applied (it is not a superset). The provider stops writing, drops IndexedDB, and the host should remount a fresh `Y.Doc`. Equal or absent epoch → apply `content` as a normal Yjs update.
-- **onDeleted**: Triggered if the instance was deleted (e.g., no permission to read/write the document).
+- **onServerReady**: Triggered once the shard document has delivered a snapshot with `metadata.fromCache === false`. The `updates` collection must also have a server snapshot **unless** that listener failed with `permission-denied` (degraded mode: snapshot writes, not treated as deleted). IndexedDB `syncLocal` and hide/unload flushes wait for this.
+- **onEpochReplace**: Triggered when `contentGeneration` (or `epochField`) on the shard document is higher than the epoch this provider hydrated with. The new `content` is **not** applied (it is not a superset). The provider stops writing, drops IndexedDB, and the host should remount a fresh `Y.Doc`. Equal or absent epoch → apply `content` as a normal Yjs update. Re-applying `content` is skipped when `snapshotSV` is already covered by the last persisted state vector.
+- **onDeleted**: Triggered if the instance was deleted (e.g., no permission to read/write the **document**). A `permission-denied` error on the `updates` collection does **not** fire this — the provider degrades to snapshot writes instead.
 - **onSaving**: Triggered when the sync to Firestore is in process (e.g., you may want to alert users not to close the window). `onSaving(false)` runs only after a **successful** write.
-- **onSaveError**: Triggered when an append/snapshot write fails or encoded delta/snapshot exceeds 1 MiB (`reason`: `save-failed` | `size-abort`). The UI should treat this as unsaved; y-fire retries failed network writes and never falls back to last-write-wins `setDoc`.
-- **onSaveWarning**: Triggered when encoded `content` or a delta is ≥ 70% of 1 MiB (`size-warn`), or a fold snapshot exceeds the cap (`size-abort` — the append itself already succeeded and update docs are kept).
+- **onSaveError**: Triggered when an append/snapshot write fails (`save-failed`), a first snapshot exceeds 1 MiB (`size-abort`), or a fold/forced-snapshot union exceeds 1 MiB (`compact-required`, once per episode). `compact-required` does not block later appends that still fit; the shard needs compaction. The UI should treat this as unsaved; y-fire retries failed network writes and never falls back to last-write-wins `setDoc`.
+- **onSaveWarning**: Triggered when a snapshot or fold write is ≥ 70% of 1 MiB (`size-warn`). Large deltas under the cap do not warn.
 
 Example:
 

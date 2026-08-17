@@ -49,12 +49,7 @@ export function unionYjsBytes(parts) {
 export function appendUpdate(db, documentPath, payload) {
     return __awaiter(this, void 0, void 0, function* () {
         const col = collection(db, updatesCollectionPath(documentPath));
-        return addDoc(col, {
-            update: Bytes.fromUint8Array(payload.update),
-            seq: payload.seq,
-            clientId: payload.clientId,
-            createdAt: serverTimestamp(),
-        });
+        return addDoc(col, Object.assign(Object.assign({ update: Bytes.fromUint8Array(payload.update), seq: payload.seq }, (payload.clientId ? { clientId: payload.clientId } : {})), { createdAt: serverTimestamp() }));
     });
 }
 export function listUpdates(db, documentPath) {
@@ -96,7 +91,7 @@ export function writeSnapshot(opts) {
 }
 export function foldUpdates(opts) {
     return __awaiter(this, void 0, void 0, function* () {
-        if (opts.listed.length === 0)
+        if (opts.listed.length === 0 && !opts.force)
             return { status: "empty" };
         const ref = doc(opts.db, opts.documentPath);
         let result = { status: "empty" };

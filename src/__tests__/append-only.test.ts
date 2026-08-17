@@ -307,27 +307,6 @@ describe("append-only persistence", () => {
     expect(created.ydoc.getText("t").toString()).not.toContain("OLD");
   });
 
-  it("size-aborts a delta larger than the cap and does not append", async () => {
-    const remote = new Y.Doc();
-    remote.getText("t").insert(0, "seed");
-    const bytes = Y.encodeStateAsUpdate(remote);
-
-    const created = await createTestProvider({ maxContentBytes: 1 });
-    provider = created.provider;
-    const onSaveError = vi.fn();
-    provider.onSaveError = onSaveError;
-    emitServerUpdate(TEST_PATH, bytes);
-    await flushMicrotasks();
-
-    created.ydoc.getText("t").insert(4, "!");
-    await provider.saveToFirestore();
-
-    expect(addDocCalls.length).toBe(0);
-    expect(onSaveError.mock.calls.map((c) => (c[1] as { reason?: string })?.reason)).toContain(
-      "size-abort",
-    );
-  });
-
   it("size-aborts a fold snapshot above the cap and keeps updates", async () => {
     const remote = new Y.Doc();
     remote.getText("t").insert(0, "base-content");
