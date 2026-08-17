@@ -59,4 +59,23 @@ describe("mergeStateVectors", () => {
       Y.encodeStateVectorFromUpdate(update),
     );
   });
+
+  it("includes the writing client on a delta encoded against a non-zero SV", () => {
+    const doc = new Y.Doc();
+    doc.getText("t").insert(0, "hello");
+    const sv = Y.encodeStateVector(doc);
+    doc.getText("t").insert(5, "!");
+    const delta = Y.encodeStateAsUpdate(doc, sv);
+
+    const fromDelta = Y.decodeStateVector(stateVectorFromUpdate(delta));
+    const fromDoc = Y.decodeStateVector(Y.encodeStateVector(doc));
+    const client = doc.clientID;
+
+    expect(fromDelta.has(client)).toBe(true);
+    expect(fromDelta.get(client)).toBe(fromDoc.get(client));
+    // Y.encodeStateVectorFromUpdate drops clients whose structs do not start at clock 0.
+    expect(Y.decodeStateVector(Y.encodeStateVectorFromUpdate(delta)).has(client)).toBe(
+      false,
+    );
+  });
 });

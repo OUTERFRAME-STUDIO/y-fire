@@ -15,8 +15,24 @@ export function mergeStateVectors(
   return Y.encodeStateVector(merged);
 }
 
+/**
+ * Exact per-client clock from an update's structs.
+ *
+ * `Y.encodeStateVectorFromUpdate` only counts a client whose structs start at
+ * clock 0, so it drops the writing client from every delta encoded against a
+ * non-zero state vector. Fold/append bookkeeping needs the true
+ * `max(clock + length)` so `lastPersistedSV` can advance.
+ */
 export function stateVectorFromUpdate(update: Uint8Array): Uint8Array {
-  return Y.encodeStateVectorFromUpdate(update);
+  const { structs } = Y.decodeUpdate(update);
+  const clocks = new Map<number, number>();
+  for (const struct of structs) {
+    if (struct instanceof Y.Skip) continue;
+    const end = struct.id.clock + struct.length;
+    const prev = clocks.get(struct.id.client) ?? 0;
+    if (end > prev) clocks.set(struct.id.client, end);
+  }
+  return Y.encodeStateVector(clocks);
 }
 
 /** True when `cover` has every client clock in `other` at least as high. */
