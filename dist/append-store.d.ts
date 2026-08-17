@@ -21,7 +21,7 @@ export declare function unionYjsBytes(parts: Array<Uint8Array | undefined | null
 export declare function appendUpdate(db: Firestore, documentPath: string, payload: {
     update: Uint8Array;
     seq: number;
-    clientId: string;
+    clientId?: string;
 }): Promise<import("@firebase/firestore").DocumentReference<import("@firebase/firestore").DocumentData, import("@firebase/firestore").DocumentData>>;
 export declare function listUpdates(db: Firestore, documentPath: string): Promise<ListedUpdate[]>;
 export declare function writeSnapshot(opts: {
@@ -48,5 +48,6 @@ export declare function foldUpdates(opts: {
     localUpdate: Uint8Array;
     documentMapper: (bytes: Bytes) => object;
     maxContentBytes: number;
+    force?: boolean;
 }): Promise<FoldResult>;
 //# sourceMappingURL=append-store.d.ts.map

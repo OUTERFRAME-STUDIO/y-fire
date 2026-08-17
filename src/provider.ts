@@ -39,13 +39,14 @@ import {
   updatesCollectionPath,
   writeSnapshot,
 } from "./append-store";
-import { mergeStateVectors, stateVectorFromUpdate } from "./state-vector";
+import { mergeStateVectors, stateVectorCovers, stateVectorFromUpdate } from "./state-vector";
 
 export type FireSaveReason =
   | "save-failed"
   | "size-abort"
   | "size-warn"
-  | "shrink";
+  | "shrink"
+  | "compact-required";
 
 export interface FireSaveContext {
   documentPath: string;
@@ -93,6 +94,7 @@ interface PeersRTC {
 
 const SNAPSHOT_BACKOFF_BASE_MS = 500;
 const SNAPSHOT_BACKOFF_MAX_MS = 16_000;
+const FOLD_BACKOFF_MS = 30_000;
 
 /**
  * FireProvider class that handles firestore data sync and awareness
@@ -163,6 +165,13 @@ export class FireProvider extends ObservableV2<any> {
   private foldUpdateThreshold: number = DEFAULT_FOLD_UPDATE_THRESHOLD;
   private foldBytesFraction: number = DEFAULT_FOLD_BYTES_FRACTION;
   private epochField: string = DEFAULT_EPOCH_FIELD;
+  private updateDocCount: number = 0;
+  private updateTotalBytes: number = 0;
+  private foldBackoffUntil?: number;
+  private foldAbortedAtSnapshotSV?: Uint8Array;
+  private foldAbortReported: boolean = false;
+  private updatesAccessDenied: boolean = false;
+  private updatesDeniedWarned: boolean = false;
 
   get clientTimeOffset() {
     return this.timeOffset;
@@ -297,7 +306,8 @@ export class FireProvider extends ObservableV2<any> {
 
   private maybeBecomeServerReady = () => {
     if (this.serverReady) return;
-    if (!this.docServerSnapshot || !this.updatesServerSnapshot) return;
+    if (!this.docServerSnapshot) return;
+    if (!this.updatesServerSnapshot && !this.updatesAccessDenied) return;
     this.serverReady = true;
     if (this.onServerReady) this.onServerReady();
     void this.syncLocal();
@@ -347,12 +357,18 @@ export class FireProvider extends ObservableV2<any> {
           } else {
             if (meta.content) {
               this.hasRemoteContent = true;
-              this.firebaseDataLastUpdatedAt = new Date().getTime();
-              Y.applyUpdate(this.doc, meta.content, "origin:firebase/update");
-              this.lastPersistedSV = mergeStateVectors(
-                this.lastPersistedSV,
-                meta.snapshotSV ?? stateVectorFromUpdate(meta.content),
-              );
+              const skipApply =
+                !!meta.snapshotSV &&
+                stateVectorCovers(this.lastPersistedSV, meta.snapshotSV);
+              if (!skipApply) {
+                this.clearFoldBackoff();
+                this.firebaseDataLastUpdatedAt = new Date().getTime();
+                Y.applyUpdate(this.doc, meta.content, "origin:firebase/update");
+                this.lastPersistedSV = mergeStateVectors(
+                  this.lastPersistedSV,
+                  meta.snapshotSV ?? stateVectorFromUpdate(meta.content),
+                );
+              }
             }
             this.hydratedEpoch = meta.epoch;
           }
@@ -383,15 +399,20 @@ export class FireProvider extends ObservableV2<any> {
       (snap) => {
         this.snapshotRetryAttempt = 0;
         const fromCache = snap.metadata?.fromCache === true;
+        this.updatesAccessDenied = false;
+        this.updateDocCount = 0;
+        this.updateTotalBytes = 0;
         if (!this.epochReplaced && typeof snap.forEach === "function") {
           snap.forEach(
             (d: { id: string; data?: () => unknown }) => {
-              if (this.appliedUpdateIds.has(d.id)) return;
               const data = (
                 typeof d.data === "function" ? d.data() : undefined
               ) as Record<string, unknown> | undefined;
               const bytes = readBytes(data?.update);
               if (!bytes) return;
+              this.updateDocCount++;
+              this.updateTotalBytes += bytes.byteLength;
+              if (this.appliedUpdateIds.has(d.id)) return;
               this.appliedUpdateIds.add(d.id);
               if (typeof data?.seq === "number" && data.seq > this.lastSeq) {
                 this.lastSeq = data.seq;
@@ -408,7 +429,14 @@ export class FireProvider extends ObservableV2<any> {
       (error) => {
         this.consoleHandler("Firestore updates sync error", error);
         if (error.code === "permission-denied") {
-          if (this.onDeleted) this.onDeleted();
+          this.updatesAccessDenied = true;
+          if (!this.updatesDeniedWarned) {
+            this.updatesDeniedWarned = true;
+            this.consoleHandler(
+              "Updates collection permission-denied; writing full snapshots until access is restored",
+            );
+          }
+          this.maybeBecomeServerReady();
           return;
         }
         this.scheduleSnapshotRetry();
@@ -641,7 +669,7 @@ export class FireProvider extends ObservableV2<any> {
         error && typeof error === "object" && "reason" in error
           ? (error as { reason?: string }).reason
           : undefined;
-      if (reason === "size-abort") {
+      if (reason === "size-abort" || reason === "compact-required") {
         return;
       }
       const code =
@@ -666,6 +694,81 @@ export class FireProvider extends ObservableV2<any> {
       this.onSaveError(err, this.saveContext(byteLength, "size-abort"));
     }
     throw err;
+  };
+
+  private clearFoldBackoff = () => {
+    this.foldBackoffUntil = undefined;
+    this.foldAbortedAtSnapshotSV = undefined;
+    this.foldAbortReported = false;
+  };
+
+  private beginFoldBackoff = () => {
+    this.foldBackoffUntil = Date.now() + FOLD_BACKOFF_MS;
+    this.foldAbortedAtSnapshotSV = this.lastPersistedSV;
+  };
+
+  private shouldSkipFold = () => {
+    if (this.foldBackoffUntil === undefined) return false;
+    if (Date.now() >= this.foldBackoffUntil) {
+      this.foldBackoffUntil = undefined;
+      return false;
+    }
+    return true;
+  };
+
+  private emitCompactRequired = (byteLength: number) => {
+    const err = Object.assign(
+      new Error(
+        "y-fire: snapshot exceeds Firestore 1 MiB limit; compact required",
+      ),
+      { reason: "compact-required" as const },
+    );
+    if (!this.foldAbortReported) {
+      this.foldAbortReported = true;
+      if (this.onSaveError) {
+        this.onSaveError(err, this.saveContext(byteLength, "compact-required"));
+      }
+    }
+    return err;
+  };
+
+  private applyFoldSuccess = (
+    fold: { snapshot: Uint8Array; byteLength: number; kind: "ok" | "warn" },
+    listed: { id: string }[],
+  ) => {
+    if (fold.kind === "warn" && this.onSaveWarning) {
+      this.onSaveWarning(this.saveContext(fold.byteLength, "size-warn"));
+    }
+    Y.applyUpdate(this.doc, fold.snapshot, "origin:firebase/update");
+    this.lastPersistedSV = mergeStateVectors(
+      this.lastPersistedSV,
+      stateVectorFromUpdate(fold.snapshot),
+    );
+    for (const item of listed) {
+      this.appliedUpdateIds.delete(item.id);
+    }
+    this.clearFoldBackoff();
+  };
+
+  private writeForcedSnapshot = async (localUpdate: Uint8Array) => {
+    const listed = this.updatesAccessDenied
+      ? []
+      : await listUpdates(this.db, this.documentPath);
+    const fold = await foldUpdates({
+      db: this.db,
+      documentPath: this.documentPath,
+      listed,
+      localUpdate,
+      documentMapper: this.documentMapper,
+      maxContentBytes: this.maxContentBytes,
+      force: true,
+    });
+    if (fold.status === "abort") {
+      this.beginFoldBackoff();
+      throw this.emitCompactRequired(fold.byteLength);
+    }
+    if (fold.status !== "ok") return;
+    this.applyFoldSuccess(fold, listed);
   };
 
   private writeFirstSnapshot = async (localUpdate: Uint8Array) => {
@@ -698,19 +801,18 @@ export class FireProvider extends ObservableV2<any> {
   };
 
   private appendDelta = async (localUpdate: Uint8Array) => {
+    if (this.updatesAccessDenied) {
+      await this.writeForcedSnapshot(localUpdate);
+      return;
+    }
     const delta = Y.encodeStateAsUpdate(this.doc, this.lastPersistedSV);
     if (delta.byteLength <= EMPTY_YJS_UPDATE_MAX_BYTES) {
       return;
     }
     const kind = contentSizeKind(delta.byteLength, this.maxContentBytes);
     if (kind === "abort") {
-      this.abortSize(
-        delta.byteLength,
-        "y-fire: encoded delta exceeds Firestore 1 MiB limit",
-      );
-    }
-    if (kind === "warn" && this.onSaveWarning) {
-      this.onSaveWarning(this.saveContext(delta.byteLength, "size-warn"));
+      await this.writeForcedSnapshot(localUpdate);
+      return;
     }
     const seq = this.lastSeq + 1;
     const result = await appendUpdate(this.db, this.documentPath, {
@@ -728,21 +830,18 @@ export class FireProvider extends ObservableV2<any> {
   };
 
   private maybeFold = async (localUpdate: Uint8Array) => {
+    if (this.shouldSkipFold()) return;
+    const bytesThreshold = Math.floor(
+      this.maxContentBytes * this.foldBytesFraction,
+    );
+    if (
+      this.updateDocCount < this.foldUpdateThreshold &&
+      this.updateTotalBytes < bytesThreshold
+    ) {
+      return;
+    }
     try {
       const listed = await listUpdates(this.db, this.documentPath);
-      const totalBytes = listed.reduce(
-        (sum, item) => sum + item.update.byteLength,
-        0,
-      );
-      const bytesThreshold = Math.floor(
-        this.maxContentBytes * this.foldBytesFraction,
-      );
-      if (
-        listed.length < this.foldUpdateThreshold &&
-        totalBytes < bytesThreshold
-      ) {
-        return;
-      }
       const fold = await foldUpdates({
         db: this.db,
         documentPath: this.documentPath,
@@ -752,23 +851,12 @@ export class FireProvider extends ObservableV2<any> {
         maxContentBytes: this.maxContentBytes,
       });
       if (fold.status === "abort") {
-        if (this.onSaveWarning) {
-          this.onSaveWarning(this.saveContext(fold.byteLength, "size-abort"));
-        }
+        this.beginFoldBackoff();
+        this.emitCompactRequired(fold.byteLength);
         return;
       }
       if (fold.status !== "ok") return;
-      if (fold.kind === "warn" && this.onSaveWarning) {
-        this.onSaveWarning(this.saveContext(fold.byteLength, "size-warn"));
-      }
-      Y.applyUpdate(this.doc, fold.snapshot, "origin:firebase/update");
-      this.lastPersistedSV = mergeStateVectors(
-        this.lastPersistedSV,
-        stateVectorFromUpdate(fold.snapshot),
-      );
-      for (const item of listed) {
-        this.appliedUpdateIds.delete(item.id);
-      }
+      this.applyFoldSuccess(fold, listed);
     } catch (error) {
       this.consoleHandler("foldUpdates error", error);
     }

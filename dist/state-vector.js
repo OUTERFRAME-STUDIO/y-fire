@@ -17,3 +17,18 @@ export function mergeStateVectors(...vectors) {
 export function stateVectorFromUpdate(update) {
     return Y.encodeStateVectorFromUpdate(update);
 }
+/** True when `cover` has every client clock in `other` at least as high. */
+export function stateVectorCovers(cover, other) {
+    var _a;
+    if (!other || other.byteLength === 0)
+        return true;
+    if (!cover || cover.byteLength === 0)
+        return false;
+    const coverMap = Y.decodeStateVector(cover);
+    const otherMap = Y.decodeStateVector(other);
+    for (const [client, clock] of otherMap) {
+        if (((_a = coverMap.get(client)) !== null && _a !== void 0 ? _a : 0) < clock)
+            return false;
+    }
+    return true;
+}

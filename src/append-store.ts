@@ -69,13 +69,13 @@ export function unionYjsBytes(
 export async function appendUpdate(
   db: Firestore,
   documentPath: string,
-  payload: { update: Uint8Array; seq: number; clientId: string },
+  payload: { update: Uint8Array; seq: number; clientId?: string },
 ) {
   const col = collection(db, updatesCollectionPath(documentPath));
   return addDoc(col, {
     update: Bytes.fromUint8Array(payload.update),
     seq: payload.seq,
-    clientId: payload.clientId,
+    ...(payload.clientId ? { clientId: payload.clientId } : {}),
     createdAt: serverTimestamp(),
   });
 }
@@ -145,8 +145,9 @@ export async function foldUpdates(opts: {
   localUpdate: Uint8Array;
   documentMapper: (bytes: Bytes) => object;
   maxContentBytes: number;
+  force?: boolean;
 }): Promise<FoldResult> {
-  if (opts.listed.length === 0) return { status: "empty" };
+  if (opts.listed.length === 0 && !opts.force) return { status: "empty" };
   const ref = doc(opts.db, opts.documentPath);
   let result: FoldResult = { status: "empty" };
   await runTransaction(opts.db, async (tx) => {
