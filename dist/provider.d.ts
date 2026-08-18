@@ -58,6 +58,7 @@ export declare const LOCAL_PERSIST_DEBOUNCE_MS = 500;
  * @param maxUpdatesThreshold maximum number of updates to wait for before sending updates to peers
  * @param maxWaitTime maximum miliseconds to wait before sending updates to peers
  * @param maxWaitFirestoreTime miliseconds to wait before syncing this client's update to firestore
+ * @param maxFirestoreDeferral maximum miliseconds local re-entry can postpone a Firestore flush
  */
 export declare class FireProvider extends ObservableV2<any> {
     readonly doc: Y.Doc;
@@ -82,6 +83,10 @@ export declare class FireProvider extends ObservableV2<any> {
     maxFirestoreDeferral: number;
     maxContentBytes: number;
     scheduledFirstAt?: number;
+    saveInFlight: boolean;
+    saveStartedAt?: number;
+    lastSaveDurationMs: number | null;
+    private saveQueued;
     firebaseDataLastUpdatedAt: number;
     instanceConnection: ObservableV2<any>;
     recreateTimeout: string | number | NodeJS.Timeout;
