@@ -107,6 +107,7 @@ export const LOCAL_PERSIST_DEBOUNCE_MS = 500;
  * @param maxUpdatesThreshold maximum number of updates to wait for before sending updates to peers
  * @param maxWaitTime maximum miliseconds to wait before sending updates to peers
  * @param maxWaitFirestoreTime miliseconds to wait before syncing this client's update to firestore
+ * @param maxFirestoreDeferral maximum miliseconds local re-entry can postpone a Firestore flush
  */
 export class FireProvider extends ObservableV2<any> {
   readonly doc: Y.Doc;
@@ -138,6 +139,10 @@ export class FireProvider extends ObservableV2<any> {
   maxFirestoreDeferral: number = 10_000;
   maxContentBytes: number = FIRESTORE_CONTENT_MAX_BYTES;
   scheduledFirstAt?: number;
+  saveInFlight: boolean = false;
+  saveStartedAt?: number;
+  lastSaveDurationMs: number | null = null;
+  private saveQueued: boolean = false;
 
   firebaseDataLastUpdatedAt: number = new Date().getTime();
 
@@ -667,44 +672,67 @@ export class FireProvider extends ObservableV2<any> {
   };
 
   saveToFirestore = async () => {
-    await this.flushSaveToLocal();
-    if (!this.serverReady || this.epochReplaced) {
+    if (this.saveInFlight) {
+      this.saveQueued = true;
       return;
     }
+    this.saveInFlight = true;
+    this.saveStartedAt = Date.now();
     if (this.firestoreTimeout) {
       clearTimeout(this.firestoreTimeout);
       this.firestoreTimeout = undefined;
     }
-    const localUpdate = Y.encodeStateAsUpdate(this.doc);
+    let flushQueuedAfterSuccess = false;
     try {
-      if (!this.hasRemoteContent) {
-        await this.writeFirstSnapshot(localUpdate);
-      } else {
-        await this.appendDelta(localUpdate);
-      }
-      this.scheduledFirstAt = undefined;
-      await this.deleteLocal();
-      if (this.onSaving) this.onSaving(false);
-    } catch (error) {
-      this.consoleHandler("saveToFirestore: CAUGHT error", error);
-      const reason =
-        error && typeof error === "object" && "reason" in error
-          ? (error as { reason?: string }).reason
-          : undefined;
-      if (reason === "size-abort" || reason === "compact-required") {
+      await this.flushSaveToLocal();
+      if (!this.serverReady || this.epochReplaced) {
+        this.saveQueued = false;
         return;
       }
-      const code =
-        error && typeof error === "object" && "code" in error
-          ? String((error as { code: unknown }).code)
-          : undefined;
-      if (this.onSaveError) {
-        this.onSaveError(
-          error,
-          this.saveContext(localUpdate.byteLength, "save-failed", { code }),
-        );
+      const localUpdate = Y.encodeStateAsUpdate(this.doc);
+      try {
+        if (!this.hasRemoteContent) {
+          await this.writeFirstSnapshot(localUpdate);
+        } else {
+          await this.appendDelta(localUpdate);
+        }
+        this.scheduledFirstAt = undefined;
+        await this.deleteLocal();
+        this.lastSaveDurationMs =
+          this.saveStartedAt !== undefined
+            ? Date.now() - this.saveStartedAt
+            : null;
+        if (this.onSaving) this.onSaving(false);
+        flushQueuedAfterSuccess = this.saveQueued;
+        this.saveQueued = false;
+      } catch (error) {
+        this.consoleHandler("saveToFirestore: CAUGHT error", error);
+        const reason =
+          error && typeof error === "object" && "reason" in error
+            ? (error as { reason?: string }).reason
+            : undefined;
+        if (reason === "size-abort" || reason === "compact-required") {
+          this.saveQueued = false;
+          return;
+        }
+        const code =
+          error && typeof error === "object" && "code" in error
+            ? String((error as { code: unknown }).code)
+            : undefined;
+        if (this.onSaveError) {
+          this.onSaveError(
+            error,
+            this.saveContext(localUpdate.byteLength, "save-failed", { code }),
+          );
+        }
+        this.scheduleSaveRetry();
       }
-      this.scheduleSaveRetry();
+    } finally {
+      this.saveInFlight = false;
+      this.saveStartedAt = undefined;
+    }
+    if (flushQueuedAfterSuccess) {
+      this.sendToFirestoreQueue();
     }
   };
 
@@ -883,20 +911,35 @@ export class FireProvider extends ObservableV2<any> {
   };
 
   sendToFirestoreQueue = () => {
-    if (this.firestoreTimeout) clearTimeout(this.firestoreTimeout);
     if (this.onSaving) this.onSaving(true);
     if (this.scheduledFirstAt === undefined) {
       this.scheduledFirstAt = Date.now();
     }
+    if (this.saveInFlight) {
+      this.saveQueued = true;
+      return;
+    }
+    const now = Date.now();
+    const elapsedSinceScheduled = now - (this.scheduledFirstAt ?? now);
+    if (this.serverReady && elapsedSinceScheduled > this.maxFirestoreDeferral) {
+      if (this.firestoreTimeout) {
+        clearTimeout(this.firestoreTimeout);
+        this.firestoreTimeout = undefined;
+      }
+      void this.saveToFirestore();
+      return;
+    }
+    if (this.firestoreTimeout) clearTimeout(this.firestoreTimeout);
     this.firestoreTimeout = setTimeout(() => {
-      const now = Date.now();
+      const tickNow = Date.now();
       const elapsedSinceLastFirebaseUpdate =
-        now - this.firebaseDataLastUpdatedAt;
-      const elapsedSinceScheduled = now - (this.scheduledFirstAt ?? now);
+        tickNow - this.firebaseDataLastUpdatedAt;
+      const elapsedSinceScheduledTick =
+        tickNow - (this.scheduledFirstAt ?? tickNow);
       const shouldSave =
         this.serverReady &&
         (elapsedSinceLastFirebaseUpdate > this.maxFirestoreWait ||
-          elapsedSinceScheduled > this.maxFirestoreDeferral);
+          elapsedSinceScheduledTick > this.maxFirestoreDeferral);
       if (shouldSave) {
         this.saveToFirestore();
       } else {

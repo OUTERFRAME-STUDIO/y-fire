@@ -38,6 +38,12 @@ export function setSetDocImpl(impl: () => Promise<void>) {
   setDocImpl = impl;
 }
 
+export let addDocImpl: () => Promise<void> = async () => {};
+
+export function setAddDocImpl(impl: () => Promise<void>) {
+  addDocImpl = impl;
+}
+
 /** In-memory Firestore docs used by `runTransaction` / `setDoc`. */
 export const firestoreDocs = new Map<string, Record<string, unknown>>();
 
@@ -73,6 +79,7 @@ export function resetFirestoreMock() {
   addDocCalls.length = 0;
   deleteDocCalls.length = 0;
   setDocImpl = async () => {};
+  addDocImpl = async () => {};
   transactionShouldFail = null;
   addDocShouldFail = null;
   firestoreDocs.clear();
@@ -307,6 +314,7 @@ export const addDoc = vi.fn(async (ref: MockRef, data: unknown) => {
   col.set(id, (data ?? {}) as Record<string, unknown>);
   addDocCalls.push({ ref, data, id });
   notifyCollection(ref.path);
+  await addDocImpl();
   return { id, path: `${ref.path}/${id}` };
 });
 
