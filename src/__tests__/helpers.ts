@@ -52,14 +52,19 @@ vi.mock("../graph", () => ({
 
 import { FireProvider } from "../provider";
 import type { Parameters } from "../provider";
+import { resetTabFoldScheduler } from "../fold-scheduler";
 
 const TEST_PATH = "projects/test/doc";
 
 export async function createTestProvider(
   overrides: Partial<Parameters> = {},
+  options: { reset?: boolean } = {},
 ) {
-  resetFirestoreMock();
-  resetIdbMock();
+  if (options.reset !== false) {
+    resetFirestoreMock();
+    resetIdbMock();
+    resetTabFoldScheduler();
+  }
 
   const ydoc = overrides.ydoc ?? new Y.Doc();
   const provider = new FireProvider({
@@ -205,3 +210,4 @@ export function hydrateControl(
 }
 
 export { FireProvider, TEST_PATH };
+export { whenTabFoldsIdle } from "../fold-scheduler";

@@ -17,6 +17,7 @@ import { createGraph } from "./graph";
 import { createPersistenceAdapter, decodeEpochMeta, encodeEpochMeta, persistenceMetaKey, } from "./persistence";
 import { EMPTY_YJS_UPDATE_MAX_BYTES, FIRESTORE_CONTENT_MAX_BYTES, contentSizeKind, } from "./firestore-limits";
 import { appendUpdate, DEFAULT_EPOCH_FIELD, DEFAULT_FOLD_BYTES_FRACTION, DEFAULT_FOLD_UPDATE_THRESHOLD, foldUpdates, listUpdates, readBytes, readSnapshotMeta, updatesCollectionPath, writeSnapshot, } from "./append-store";
+import { enqueueTabFold } from "./fold-scheduler";
 import { mergeStateVectors, stateVectorCovers, stateVectorFromUpdate } from "./state-vector";
 const SNAPSHOT_BACKOFF_BASE_MS = 500;
 const SNAPSHOT_BACKOFF_MAX_MS = 16000;
@@ -149,6 +150,9 @@ export class FireProvider extends ObservableV2 {
         this.epochField = DEFAULT_EPOCH_FIELD;
         this.updateDocCount = 0;
         this.updateTotalBytes = 0;
+        this.listedUpdates = [];
+        this.foldInFlight = false;
+        this.foldQueued = false;
         this.foldAbortReported = false;
         this.updatesAccessDenied = false;
         this.updatesDeniedWarned = false;
@@ -360,12 +364,19 @@ export class FireProvider extends ObservableV2 {
                 this.updatesAccessDenied = false;
                 this.updateDocCount = 0;
                 this.updateTotalBytes = 0;
+                const listed = [];
                 if (!this.epochReplaced && typeof snap.forEach === "function") {
                     snap.forEach((d) => {
                         const data = (typeof d.data === "function" ? d.data() : undefined);
                         const bytes = readBytes(data === null || data === void 0 ? void 0 : data.update);
                         if (!bytes)
                             return;
+                        listed.push({
+                            id: d.id,
+                            update: bytes,
+                            seq: typeof (data === null || data === void 0 ? void 0 : data.seq) === "number" ? data.seq : 0,
+                            clientId: typeof (data === null || data === void 0 ? void 0 : data.clientId) === "string" ? data.clientId : undefined,
+                        });
                         this.updateDocCount++;
                         this.updateTotalBytes += bytes.byteLength;
                         if (this.appliedUpdateIds.has(d.id))
@@ -377,6 +388,7 @@ export class FireProvider extends ObservableV2 {
                         this.applyRemoteUpdateBytes(bytes);
                     });
                 }
+                this.listedUpdates = listed;
                 if (!fromCache) {
                     this.updatesServerSnapshot = true;
                     this.maybeBecomeServerReady();
@@ -566,6 +578,7 @@ export class FireProvider extends ObservableV2 {
                 this.firestoreTimeout = undefined;
             }
             let flushQueuedAfterSuccess = false;
+            let foldAfterSave;
             try {
                 yield this.flushSaveToLocal();
                 if (!this.serverReady || this.epochReplaced) {
@@ -578,7 +591,7 @@ export class FireProvider extends ObservableV2 {
                         yield this.writeFirstSnapshot(localUpdate);
                     }
                     else {
-                        yield this.appendDelta(localUpdate);
+                        foldAfterSave = yield this.appendDelta(localUpdate);
                     }
                     this.scheduledFirstAt = undefined;
                     yield this.deleteLocal();
@@ -590,6 +603,8 @@ export class FireProvider extends ObservableV2 {
                         this.onSaving(false);
                     flushQueuedAfterSuccess = this.saveQueued;
                     this.saveQueued = false;
+                    if (foldAfterSave)
+                        this.scheduleFold(foldAfterSave);
                 }
                 catch (error) {
                     this.consoleHandler("saveToFirestore: CAUGHT error", error);
@@ -662,6 +677,10 @@ export class FireProvider extends ObservableV2 {
             // Persist the written snapshot's SV, not the live doc: concurrent local
             // edits during the fold await must remain unpersisted for the next append.
             this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, stateVectorFromUpdate(fold.snapshot));
+            const foldedIds = new Set(listed.map((item) => item.id));
+            this.listedUpdates = this.listedUpdates.filter((u) => !foldedIds.has(u.id));
+            this.updateDocCount = this.listedUpdates.length;
+            this.updateTotalBytes = this.listedUpdates.reduce((sum, u) => sum + u.update.byteLength, 0);
             for (const item of listed) {
                 this.appliedUpdateIds.delete(item.id);
             }
@@ -670,7 +689,9 @@ export class FireProvider extends ObservableV2 {
         this.writeForcedSnapshot = (localUpdate) => __awaiter(this, void 0, void 0, function* () {
             const listed = this.updatesAccessDenied
                 ? []
-                : yield listUpdates(this.db, this.documentPath);
+                : this.listedUpdates.length > 0
+                    ? this.listedUpdates.slice()
+                    : yield listUpdates(this.db, this.documentPath);
             const fold = yield foldUpdates({
                 db: this.db,
                 documentPath: this.documentPath,
@@ -736,9 +757,34 @@ export class FireProvider extends ObservableV2 {
             if (result === null || result === void 0 ? void 0 : result.id)
                 this.appliedUpdateIds.add(result.id);
             this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, svAtEncode);
-            yield this.maybeFold(localUpdate);
+            return localUpdate;
         });
+        this.scheduleFold = (localUpdate) => {
+            if (this.foldInFlight) {
+                this.foldQueued = true;
+                this.pendingFoldLocal = localUpdate;
+                return;
+            }
+            this.foldInFlight = true;
+            enqueueTabFold(() => __awaiter(this, void 0, void 0, function* () {
+                var _a;
+                try {
+                    yield this.maybeFold(localUpdate);
+                }
+                finally {
+                    this.foldInFlight = false;
+                    if (this.foldQueued) {
+                        this.foldQueued = false;
+                        const next = (_a = this.pendingFoldLocal) !== null && _a !== void 0 ? _a : Y.encodeStateAsUpdate(this.doc);
+                        this.pendingFoldLocal = undefined;
+                        this.scheduleFold(next);
+                    }
+                }
+            }));
+        };
         this.maybeFold = (localUpdate) => __awaiter(this, void 0, void 0, function* () {
+            if (this.epochReplaced)
+                return;
             if (this.shouldSkipFold())
                 return;
             const bytesThreshold = Math.floor(this.maxContentBytes * this.foldBytesFraction);
@@ -747,7 +793,7 @@ export class FireProvider extends ObservableV2 {
                 return;
             }
             try {
-                const listed = yield listUpdates(this.db, this.documentPath);
+                const listed = this.listedUpdates.slice();
                 const fold = yield foldUpdates({
                     db: this.db,
                     documentPath: this.documentPath,
