@@ -38,7 +38,9 @@ import {
   readSnapshotMeta,
   updatesCollectionPath,
   writeSnapshot,
+  type ListedUpdate,
 } from "./append-store";
+import { enqueueTabFold } from "./fold-scheduler";
 import { mergeStateVectors, stateVectorCovers, stateVectorFromUpdate } from "./state-vector";
 
 export type FireSaveReason =
@@ -175,6 +177,10 @@ export class FireProvider extends ObservableV2<any> {
   private epochField: string = DEFAULT_EPOCH_FIELD;
   private updateDocCount: number = 0;
   private updateTotalBytes: number = 0;
+  private listedUpdates: ListedUpdate[] = [];
+  private foldInFlight: boolean = false;
+  private foldQueued: boolean = false;
+  private pendingFoldLocal?: Uint8Array;
   private foldBackoffUntil?: number;
   private foldAbortedAtSnapshotSV?: Uint8Array;
   private foldAbortReported: boolean = false;
@@ -428,6 +434,7 @@ export class FireProvider extends ObservableV2<any> {
         this.updatesAccessDenied = false;
         this.updateDocCount = 0;
         this.updateTotalBytes = 0;
+        const listed: ListedUpdate[] = [];
         if (!this.epochReplaced && typeof snap.forEach === "function") {
           snap.forEach(
             (d: { id: string; data?: () => unknown }) => {
@@ -436,6 +443,13 @@ export class FireProvider extends ObservableV2<any> {
               ) as Record<string, unknown> | undefined;
               const bytes = readBytes(data?.update);
               if (!bytes) return;
+              listed.push({
+                id: d.id,
+                update: bytes,
+                seq: typeof data?.seq === "number" ? data.seq : 0,
+                clientId:
+                  typeof data?.clientId === "string" ? data.clientId : undefined,
+              });
               this.updateDocCount++;
               this.updateTotalBytes += bytes.byteLength;
               if (this.appliedUpdateIds.has(d.id)) return;
@@ -447,6 +461,7 @@ export class FireProvider extends ObservableV2<any> {
             },
           );
         }
+        this.listedUpdates = listed;
         if (!fromCache) {
           this.updatesServerSnapshot = true;
           this.maybeBecomeServerReady();
@@ -683,6 +698,7 @@ export class FireProvider extends ObservableV2<any> {
       this.firestoreTimeout = undefined;
     }
     let flushQueuedAfterSuccess = false;
+    let foldAfterSave: Uint8Array | undefined;
     try {
       await this.flushSaveToLocal();
       if (!this.serverReady || this.epochReplaced) {
@@ -694,7 +710,7 @@ export class FireProvider extends ObservableV2<any> {
         if (!this.hasRemoteContent) {
           await this.writeFirstSnapshot(localUpdate);
         } else {
-          await this.appendDelta(localUpdate);
+          foldAfterSave = await this.appendDelta(localUpdate);
         }
         this.scheduledFirstAt = undefined;
         await this.deleteLocal();
@@ -705,6 +721,7 @@ export class FireProvider extends ObservableV2<any> {
         if (this.onSaving) this.onSaving(false);
         flushQueuedAfterSuccess = this.saveQueued;
         this.saveQueued = false;
+        if (foldAfterSave) this.scheduleFold(foldAfterSave);
       } catch (error) {
         this.consoleHandler("saveToFirestore: CAUGHT error", error);
         const reason =
@@ -796,6 +813,13 @@ export class FireProvider extends ObservableV2<any> {
       this.lastPersistedSV,
       stateVectorFromUpdate(fold.snapshot),
     );
+    const foldedIds = new Set(listed.map((item) => item.id));
+    this.listedUpdates = this.listedUpdates.filter((u) => !foldedIds.has(u.id));
+    this.updateDocCount = this.listedUpdates.length;
+    this.updateTotalBytes = this.listedUpdates.reduce(
+      (sum, u) => sum + u.update.byteLength,
+      0,
+    );
     for (const item of listed) {
       this.appliedUpdateIds.delete(item.id);
     }
@@ -805,7 +829,9 @@ export class FireProvider extends ObservableV2<any> {
   private writeForcedSnapshot = async (localUpdate: Uint8Array) => {
     const listed = this.updatesAccessDenied
       ? []
-      : await listUpdates(this.db, this.documentPath);
+      : this.listedUpdates.length > 0
+        ? this.listedUpdates.slice()
+        : await listUpdates(this.db, this.documentPath);
     const fold = await foldUpdates({
       db: this.db,
       documentPath: this.documentPath,
@@ -850,7 +876,9 @@ export class FireProvider extends ObservableV2<any> {
     this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, svAtEncode);
   };
 
-  private appendDelta = async (localUpdate: Uint8Array) => {
+  private appendDelta = async (
+    localUpdate: Uint8Array,
+  ): Promise<Uint8Array | undefined> => {
     if (this.updatesAccessDenied) {
       await this.writeForcedSnapshot(localUpdate);
       return;
@@ -874,10 +902,33 @@ export class FireProvider extends ObservableV2<any> {
     this.lastSeq = seq;
     if (result?.id) this.appliedUpdateIds.add(result.id);
     this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, svAtEncode);
-    await this.maybeFold(localUpdate);
+    return localUpdate;
+  };
+
+  private scheduleFold = (localUpdate: Uint8Array) => {
+    if (this.foldInFlight) {
+      this.foldQueued = true;
+      this.pendingFoldLocal = localUpdate;
+      return;
+    }
+    this.foldInFlight = true;
+    enqueueTabFold(async () => {
+      try {
+        await this.maybeFold(localUpdate);
+      } finally {
+        this.foldInFlight = false;
+        if (this.foldQueued) {
+          this.foldQueued = false;
+          const next = this.pendingFoldLocal ?? Y.encodeStateAsUpdate(this.doc);
+          this.pendingFoldLocal = undefined;
+          this.scheduleFold(next);
+        }
+      }
+    });
   };
 
   private maybeFold = async (localUpdate: Uint8Array) => {
+    if (this.epochReplaced) return;
     if (this.shouldSkipFold()) return;
     const bytesThreshold = Math.floor(
       this.maxContentBytes * this.foldBytesFraction,
@@ -889,7 +940,7 @@ export class FireProvider extends ObservableV2<any> {
       return;
     }
     try {
-      const listed = await listUpdates(this.db, this.documentPath);
+      const listed = this.listedUpdates.slice();
       const fold = await foldUpdates({
         db: this.db,
         documentPath: this.documentPath,

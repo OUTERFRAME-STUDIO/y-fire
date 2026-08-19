@@ -65,6 +65,12 @@ export function setAddDocError(error: unknown | null) {
   addDocShouldFail = error;
 }
 
+export let runTransactionBefore: () => Promise<void> = async () => {};
+
+export function setRunTransactionBefore(impl: () => Promise<void>) {
+  runTransactionBefore = impl;
+}
+
 export let onSnapshotCallCount = 0;
 
 export const snapshotSubscriptions = new Map<
@@ -82,6 +88,7 @@ export function resetFirestoreMock() {
   addDocImpl = async () => {};
   transactionShouldFail = null;
   addDocShouldFail = null;
+  runTransactionBefore = async () => {};
   firestoreDocs.clear();
   firestoreCollections.clear();
   onSnapshotCallCount = 0;
@@ -349,6 +356,7 @@ type Transaction = {
 
 export const runTransaction = vi.fn(
   async (_db: unknown, updateFn: (tx: Transaction) => Promise<unknown>) => {
+    await runTransactionBefore();
     if (transactionShouldFail) {
       throw transactionShouldFail;
     }

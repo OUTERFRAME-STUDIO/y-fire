@@ -21,6 +21,7 @@ import {
   flushMicrotasks,
   TEST_PATH,
   FireProvider,
+  whenTabFoldsIdle,
 } from "./helpers";
 import { FIRESTORE_CONTENT_MAX_BYTES } from "../firestore-limits";
 
@@ -51,6 +52,7 @@ describe("DEV-67 QA regressions", () => {
   });
 
   afterEach(async () => {
+    await whenTabFoldsIdle();
     if (provider) {
       await provider.kill();
       provider = undefined;
@@ -169,17 +171,18 @@ describe("DEV-67 QA regressions", () => {
 
     getDocs.mockClear();
     await provider.saveToFirestore();
-    const listReads = getDocs.mock.calls.length;
-    expect(listReads).toBeGreaterThan(0);
+    await whenTabFoldsIdle();
+    expect(getDocs).not.toHaveBeenCalled();
     expect(addDocCalls.length).toBe(1);
     expect(saveReasons(onSaveError)).toEqual(["compact-required"]);
     expect(firestoreCollections.get(updatesPath(TEST_PATH))?.size).toBe(1);
 
     created.ydoc.getText("t").insert(13, "y");
     await provider.saveToFirestore();
+    await whenTabFoldsIdle();
 
     expect(addDocCalls.length).toBe(2);
-    expect(getDocs.mock.calls.length).toBe(listReads);
+    expect(getDocs).not.toHaveBeenCalled();
     expect(saveReasons(onSaveError)).toEqual(["compact-required"]);
     expect(firestoreCollections.get(updatesPath(TEST_PATH))?.size).toBe(2);
   });

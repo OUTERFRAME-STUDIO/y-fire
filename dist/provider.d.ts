@@ -116,6 +116,10 @@ export declare class FireProvider extends ObservableV2<any> {
     private epochField;
     private updateDocCount;
     private updateTotalBytes;
+    private listedUpdates;
+    private foldInFlight;
+    private foldQueued;
+    private pendingFoldLocal?;
     private foldBackoffUntil?;
     private foldAbortedAtSnapshotSV?;
     private foldAbortReported;
@@ -164,6 +168,7 @@ export declare class FireProvider extends ObservableV2<any> {
     private writeForcedSnapshot;
     private writeFirstSnapshot;
     private appendDelta;
+    private scheduleFold;
     private maybeFold;
     sendToFirestoreQueue: () => void;
     sendCache: (from: string) => void;

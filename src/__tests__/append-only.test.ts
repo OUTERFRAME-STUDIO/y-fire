@@ -6,10 +6,11 @@ import {
   emitUpdatesSnapshot,
   firestoreCollections,
   firestoreDocs,
-  getDocs,
+  runTransaction,
   setAddDocError,
   setDocCalls,
   seedFirestoreUpdate,
+  setRunTransactionBefore,
   updatesPath,
 } from "./_mocks/firestore";
 import { getIdbDeleteCount, idbStore } from "./_mocks/idb";
@@ -27,6 +28,7 @@ import {
   markServerReady,
   TEST_PATH,
   FireProvider,
+  whenTabFoldsIdle,
 } from "./helpers";
 
 function sequentialPayload(): {
@@ -69,6 +71,7 @@ describe("append-only persistence", () => {
   });
 
   afterEach(async () => {
+    await whenTabFoldsIdle();
     if (provider) {
       await provider.kill();
       provider = undefined;
@@ -275,6 +278,7 @@ describe("append-only persistence", () => {
 
     created.ydoc.getText("t").insert(5, "B");
     await provider.saveToFirestore();
+    await whenTabFoldsIdle();
 
     const folded = firestoreDocs.get(TEST_PATH);
     expect(folded?.contentGeneration).toBeUndefined();
@@ -300,21 +304,25 @@ describe("append-only persistence", () => {
     await provider.saveToFirestore();
     created.ydoc.getText("t").insert(5, "B");
 
-    const originalGetDocs = getDocs.getMockImplementation();
-    getDocs.mockImplementation(async (ref) => {
-      const col = firestoreCollections.get(ref.path) ?? new Map();
-      const { makeQuerySnapshot } = await import("./_mocks/firestore");
-      const result = makeQuerySnapshot(col);
-      const late = new Y.Doc();
-      late.getText("late").insert(0, "concurrent");
-      seedFirestoreUpdate(TEST_PATH, "concurrent", Y.encodeStateAsUpdate(late), {
-        seq: 99,
-      });
-      return result;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
     });
+    setRunTransactionBefore(() => gate);
 
     await provider.saveToFirestore();
-    getDocs.mockImplementation(originalGetDocs as typeof originalGetDocs);
+    for (let i = 0; i < 80 && runTransaction.mock.calls.length === 0; i++) {
+      await Promise.resolve();
+    }
+
+    const late = new Y.Doc();
+    late.getText("late").insert(0, "concurrent");
+    seedFirestoreUpdate(TEST_PATH, "concurrent", Y.encodeStateAsUpdate(late), {
+      seq: 99,
+    });
+
+    release();
+    await whenTabFoldsIdle();
 
     const remaining = firestoreCollections.get(updatesPath(TEST_PATH));
     expect(remaining?.has("concurrent")).toBe(true);
@@ -394,6 +402,7 @@ describe("append-only persistence", () => {
     expect(delta.byteLength).toBeLessThanOrEqual(provider.maxContentBytes);
 
     await provider.saveToFirestore();
+    await whenTabFoldsIdle();
 
     expect(addDocCalls.length).toBe(1);
     expect(firestoreCollections.get(updatesPath(TEST_PATH))?.size).toBe(1);
@@ -417,6 +426,7 @@ describe("append-only persistence", () => {
     const snapshotSize = Y.encodeStateAsUpdate(created.ydoc).byteLength;
     provider.maxContentBytes = Math.ceil(snapshotSize / 0.7);
     await provider.saveToFirestore();
+    await whenTabFoldsIdle();
 
     expect(onSaveWarning.mock.calls.map((c) => (c[0] as { reason?: string })?.reason)).toContain(
       "size-warn",
