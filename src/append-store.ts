@@ -21,6 +21,38 @@ export function updatesCollectionPath(documentPath: string): string {
   return `${documentPath}/${UPDATES_SUBCOLLECTION}`;
 }
 
+export function isAlreadyExistsError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const code = (error as { code?: unknown }).code;
+  return code === "already-exists" || code === "firestore/already-exists";
+}
+
+function errorMessage(error: unknown): string {
+  if (typeof error === "string") return error;
+  if (error instanceof Error) return error.message;
+  if (
+    error &&
+    typeof error === "object" &&
+    "message" in error &&
+    typeof (error as { message: unknown }).message === "string"
+  ) {
+    return (error as { message: string }).message;
+  }
+  return "";
+}
+
+export function updateIdFromAlreadyExistsError(
+  error: unknown,
+): string | undefined {
+  const message = errorMessage(error).trimEnd();
+  const marker = `/${UPDATES_SUBCOLLECTION}/`;
+  const idx = message.lastIndexOf(marker);
+  if (idx < 0) return undefined;
+  const rest = message.slice(idx + marker.length);
+  const id = rest.split(/[/\s]/)[0];
+  return id || undefined;
+}
+
 export function readBytes(value: unknown): Uint8Array | undefined {
   if (!value || typeof (value as { toUint8Array?: unknown }).toUint8Array !== "function") {
     return undefined;

@@ -16,7 +16,7 @@ import { WebRtc } from "./webrtc";
 import { createGraph } from "./graph";
 import { createPersistenceAdapter, decodeEpochMeta, encodeEpochMeta, persistenceMetaKey, } from "./persistence";
 import { EMPTY_YJS_UPDATE_MAX_BYTES, FIRESTORE_CONTENT_MAX_BYTES, contentSizeKind, } from "./firestore-limits";
-import { appendUpdate, DEFAULT_EPOCH_FIELD, DEFAULT_FOLD_BYTES_FRACTION, DEFAULT_FOLD_UPDATE_THRESHOLD, foldUpdates, listUpdates, readBytes, readSnapshotMeta, updatesCollectionPath, writeSnapshot, } from "./append-store";
+import { appendUpdate, DEFAULT_EPOCH_FIELD, DEFAULT_FOLD_BYTES_FRACTION, DEFAULT_FOLD_UPDATE_THRESHOLD, foldUpdates, isAlreadyExistsError, listUpdates, readBytes, readSnapshotMeta, updateIdFromAlreadyExistsError, updatesCollectionPath, writeSnapshot, } from "./append-store";
 import { enqueueTabFold } from "./fold-scheduler";
 import { mergeStateVectors, stateVectorCovers, stateVectorFromUpdate } from "./state-vector";
 const SNAPSHOT_BACKOFF_BASE_MS = 500;
@@ -748,11 +748,21 @@ export class FireProvider extends ObservableV2 {
                 return;
             }
             const seq = this.lastSeq + 1;
-            const result = yield appendUpdate(this.db, this.documentPath, {
-                update: delta,
-                seq,
-                clientId: this.uid,
-            });
+            let result;
+            try {
+                result = yield appendUpdate(this.db, this.documentPath, {
+                    update: delta,
+                    seq,
+                    clientId: this.uid,
+                });
+            }
+            catch (error) {
+                // Create already committed / lost ack.
+                if (!isAlreadyExistsError(error))
+                    throw error;
+                const id = updateIdFromAlreadyExistsError(error);
+                result = id ? { id } : undefined;
+            }
             this.lastSeq = seq;
             if (result === null || result === void 0 ? void 0 : result.id)
                 this.appliedUpdateIds.add(result.id);

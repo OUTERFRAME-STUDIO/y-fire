@@ -5,6 +5,8 @@ export declare const SNAPSHOT_SV_FIELD = "snapshotSV";
 export declare const DEFAULT_FOLD_UPDATE_THRESHOLD = 20;
 export declare const DEFAULT_FOLD_BYTES_FRACTION = 0.5;
 export declare function updatesCollectionPath(documentPath: string): string;
+export declare function isAlreadyExistsError(error: unknown): boolean;
+export declare function updateIdFromAlreadyExistsError(error: unknown): string | undefined;
 export declare function readBytes(value: unknown): Uint8Array | undefined;
 export declare function readSnapshotMeta(data: Record<string, unknown> | undefined, epochField?: string): {
     content?: Uint8Array;
