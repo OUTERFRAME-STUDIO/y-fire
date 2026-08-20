@@ -18,6 +18,35 @@ export const DEFAULT_FOLD_BYTES_FRACTION = 0.5;
 export function updatesCollectionPath(documentPath) {
     return `${documentPath}/${UPDATES_SUBCOLLECTION}`;
 }
+export function isAlreadyExistsError(error) {
+    if (!error || typeof error !== "object")
+        return false;
+    const code = error.code;
+    return code === "already-exists" || code === "firestore/already-exists";
+}
+function errorMessage(error) {
+    if (typeof error === "string")
+        return error;
+    if (error instanceof Error)
+        return error.message;
+    if (error &&
+        typeof error === "object" &&
+        "message" in error &&
+        typeof error.message === "string") {
+        return error.message;
+    }
+    return "";
+}
+export function updateIdFromAlreadyExistsError(error) {
+    const message = errorMessage(error).trimEnd();
+    const marker = `/${UPDATES_SUBCOLLECTION}/`;
+    const idx = message.lastIndexOf(marker);
+    if (idx < 0)
+        return undefined;
+    const rest = message.slice(idx + marker.length);
+    const id = rest.split(/[/\s]/)[0];
+    return id || undefined;
+}
 export function readBytes(value) {
     if (!value || typeof value.toUint8Array !== "function") {
         return undefined;

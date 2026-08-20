@@ -463,4 +463,109 @@ describe("append-only persistence", () => {
     expect(onSaveError).toHaveBeenCalled();
     expect(onSaving).not.toHaveBeenCalledWith(false);
   });
+
+  it("already-exists on append is treated as success, advances lastPersistedSV, and records the update id", async () => {
+    const conflictId = "Jyg4o06ryGIRmQXbLHDo";
+    const remote = new Y.Doc();
+    remote.getText("t").insert(0, "server");
+    const bytes = Y.encodeStateAsUpdate(remote);
+
+    const created = await createTestProvider();
+    provider = created.provider;
+    emitServerUpdate(TEST_PATH, bytes);
+    await flushMicrotasks();
+
+    const svBeforeFirst = Y.encodeStateVector(created.ydoc);
+    created.ydoc.getText("t").insert(6, "A".repeat(2000));
+    const firstDelta = Y.encodeStateAsUpdate(created.ydoc, svBeforeFirst);
+    const firstKeys = nonSkipStructKeys(firstDelta);
+
+    const onSaving = vi.fn();
+    const onSaveError = vi.fn();
+    provider.onSaving = onSaving;
+    provider.onSaveError = onSaveError;
+    setAddDocError(
+      Object.assign(
+        new Error(
+          `FirebaseError: Document already exists: projects/example-project/databases/(default)/documents/projects/test/doc/updates/${conflictId}`,
+        ),
+        { code: "already-exists" },
+      ),
+    );
+
+    onSaving.mockClear();
+    const deletesBefore = getIdbDeleteCount();
+    await provider.saveToFirestore();
+
+    expect(onSaveError).not.toHaveBeenCalled();
+    expect(onSaving).toHaveBeenCalledWith(false);
+    expect(getIdbDeleteCount()).toBeGreaterThan(deletesBefore);
+    expect(addDocCalls.length).toBe(0);
+
+    const poison = new Y.Doc();
+    poison.getText("t").insert(0, "SHOULD_NOT_APPLY");
+    seedFirestoreUpdate(TEST_PATH, conflictId, Y.encodeStateAsUpdate(poison), {
+      seq: 99,
+    });
+    emitUpdatesSnapshot(TEST_PATH);
+    await flushMicrotasks();
+    expect(created.ydoc.getText("t").toString()).not.toContain("SHOULD_NOT_APPLY");
+
+    setAddDocError(null);
+    created.ydoc.getText("t").insert(2006, "B");
+    await provider.saveToFirestore();
+
+    expect(addDocCalls.length).toBe(1);
+    const secondDelta = decodeUpdateBytes(addDocCalls[0]?.data);
+    expect(secondDelta.byteLength).toBeLessThan(firstDelta.byteLength / 10);
+    const secondKeys = nonSkipStructKeys(secondDelta);
+    for (const key of firstKeys) {
+      expect(secondKeys.has(key)).toBe(false);
+    }
+  });
+
+  it("already-exists without an /updates/ path still advances lastPersistedSV", async () => {
+    const remote = new Y.Doc();
+    remote.getText("t").insert(0, "server");
+    const bytes = Y.encodeStateAsUpdate(remote);
+
+    const created = await createTestProvider();
+    provider = created.provider;
+    emitServerUpdate(TEST_PATH, bytes);
+    await flushMicrotasks();
+
+    const svBeforeFirst = Y.encodeStateVector(created.ydoc);
+    created.ydoc.getText("t").insert(6, "A".repeat(2000));
+    const firstDelta = Y.encodeStateAsUpdate(created.ydoc, svBeforeFirst);
+    const firstKeys = nonSkipStructKeys(firstDelta);
+
+    const onSaving = vi.fn();
+    const onSaveError = vi.fn();
+    provider.onSaving = onSaving;
+    provider.onSaveError = onSaveError;
+    setAddDocError(
+      Object.assign(new Error("FirebaseError: Document already exists"), {
+        code: "already-exists",
+      }),
+    );
+
+    onSaving.mockClear();
+    await provider.saveToFirestore();
+
+    expect(onSaveError).not.toHaveBeenCalled();
+    expect(onSaving).toHaveBeenCalledWith(false);
+
+    setAddDocError(null);
+    created.ydoc.getText("t").insert(2006, "B");
+    await provider.saveToFirestore();
+
+    expect(addDocCalls.length).toBe(1);
+    const secondDelta = decodeUpdateBytes(addDocCalls[0]?.data);
+    expect(secondDelta.byteLength).toBeLessThan(firstDelta.byteLength / 10);
+    const secondKeys = nonSkipStructKeys(secondDelta);
+    for (const key of firstKeys) {
+      expect(secondKeys.has(key)).toBe(false);
+    }
+  });
 });
+

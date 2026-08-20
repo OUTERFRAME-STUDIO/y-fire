@@ -33,9 +33,11 @@ import {
   DEFAULT_FOLD_BYTES_FRACTION,
   DEFAULT_FOLD_UPDATE_THRESHOLD,
   foldUpdates,
+  isAlreadyExistsError,
   listUpdates,
   readBytes,
   readSnapshotMeta,
+  updateIdFromAlreadyExistsError,
   updatesCollectionPath,
   writeSnapshot,
   type ListedUpdate,
@@ -894,11 +896,19 @@ export class FireProvider extends ObservableV2<any> {
       return;
     }
     const seq = this.lastSeq + 1;
-    const result = await appendUpdate(this.db, this.documentPath, {
-      update: delta,
-      seq,
-      clientId: this.uid,
-    });
+    let result: { id?: string } | undefined;
+    try {
+      result = await appendUpdate(this.db, this.documentPath, {
+        update: delta,
+        seq,
+        clientId: this.uid,
+      });
+    } catch (error) {
+      // Create already committed / lost ack.
+      if (!isAlreadyExistsError(error)) throw error;
+      const id = updateIdFromAlreadyExistsError(error);
+      result = id ? { id } : undefined;
+    }
     this.lastSeq = seq;
     if (result?.id) this.appliedUpdateIds.add(result.id);
     this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, svAtEncode);
