@@ -4,6 +4,8 @@ export type {
   FireSaveContext,
   FireSaveReason,
   EpochReplaceEvent,
+  SnapshotMeta,
+  SnapshotStore,
 } from "./provider";
 export type { PersistenceMode } from "./persistence";
 export {

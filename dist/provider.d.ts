@@ -6,6 +6,8 @@ import { ObservableV2 } from "lib0/observable";
 import * as awarenessProtocol from "y-protocols/awareness";
 import { WebRtc } from "./webrtc";
 import { PersistenceMode } from "./persistence";
+import { type SnapshotStore } from "./append-store";
+export type { SnapshotMeta, SnapshotStore } from "./append-store";
 export type FireSaveReason = "save-failed" | "size-abort" | "size-warn" | "shrink" | "compact-required";
 export interface FireSaveContext {
     documentPath: string;
@@ -38,6 +40,12 @@ export interface Parameters {
     foldBytesFraction?: number;
     /** Epoch field name; defaults to `contentGeneration`. */
     epochField?: string;
+    /**
+     * Optional external snapshot blob store. When set, the provider does not
+     * read or write Firestore `content` Bytes; snapshots live in the store and
+     * the shard doc holds metadata only. WAL `updates/*` is unchanged.
+     */
+    snapshotStore?: SnapshotStore;
 }
 interface PeersRTC {
     receivers: {
@@ -125,6 +133,8 @@ export declare class FireProvider extends ObservableV2<any> {
     private foldAbortReported;
     private updatesAccessDenied;
     private updatesDeniedWarned;
+    private snapshotStore?;
+    private snapshotHydrateGen;
     get clientTimeOffset(): number;
     ready: boolean;
     serverReady: boolean;
@@ -147,6 +157,12 @@ export declare class FireProvider extends ObservableV2<any> {
     private maybeBecomeServerReady;
     private applyRemoteUpdateBytes;
     trackData: () => void;
+    private handleDocSnapshot;
+    /**
+     * Apply remote snapshot bytes. Returns false when a storage read failed
+     * (retry scheduled) or a newer snapshot superseded this one.
+     */
+    private applyRemoteSnapshot;
     trackMesh: () => void;
     reconnect: () => void;
     trackConnections: () => Promise<void>;
@@ -188,7 +204,6 @@ export declare class FireProvider extends ObservableV2<any> {
     consoleHandler: (message: any, data?: any) => void;
     destroy: () => void;
     kill(keepReadOnly?: boolean): Promise<void>;
-    constructor({ firebaseApp, ydoc, path, docMapper, maxUpdatesThreshold, maxWaitTime, maxWaitFirestoreTime, maxFirestoreDeferral, persistence, maxContentBytes, foldUpdateThreshold, foldBytesFraction, epochField, }: Parameters);
+    constructor({ firebaseApp, ydoc, path, docMapper, maxUpdatesThreshold, maxWaitTime, maxWaitFirestoreTime, maxFirestoreDeferral, persistence, maxContentBytes, foldUpdateThreshold, foldBytesFraction, epochField, snapshotStore, }: Parameters);
 }
-export {};
 //# sourceMappingURL=provider.d.ts.map
