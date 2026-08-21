@@ -163,6 +163,25 @@ describe("snapshotStore persistence", () => {
     expect(meta.snapshotSV).toEqual(sv);
   });
 
+  it("does not write snapshotStore when Firestore already has contentStoragePath", async () => {
+    const { store, write } = createMemorySnapshotStore();
+    const created = await createTestProvider({ snapshotStore: store });
+    provider = created.provider;
+    await markServerReady(TEST_PATH);
+    expect(write).toHaveBeenCalledTimes(0);
+
+    const packed = new Y.Doc();
+    packed.getText("t").insert(0, "packed-payload");
+    const snapshot = Y.encodeStateAsUpdate(packed);
+    const meta = await store.write(snapshot);
+    write.mockClear();
+    seedStorageShard(TEST_PATH, meta);
+
+    created.ydoc.getMap("bodies");
+    await provider.saveToFirestore();
+    expect(write).not.toHaveBeenCalled();
+  });
+
   it("writes a ~1.5MB first snapshot via the store without a content field or size-abort", async () => {
     const { store, write } = createMemorySnapshotStore();
     const created = await createTestProvider({ snapshotStore: store });

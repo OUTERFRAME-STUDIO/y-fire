@@ -228,6 +228,17 @@ export async function writeSnapshot(opts: {
   let outcome: "written" | "exists" = "written";
   let stored: SnapshotMeta | undefined;
   if (opts.snapshotStore) {
+    // Peek first. Writing the store before this check clobbers an
+    // Admin-packed blob when hasRemoteContent is still false (empty
+    // first-write after a missing-path hydrate).
+    let alreadyExists = false;
+    await runTransaction(opts.db, async (tx) => {
+      const snap = await tx.get(ref);
+      alreadyExists = hasExistingSnapshot(
+        snap.data() as Record<string, unknown> | undefined,
+      );
+    });
+    if (alreadyExists) return "exists";
     stored = await opts.snapshotStore.write(opts.content);
   }
   await runTransaction(opts.db, async (tx) => {
