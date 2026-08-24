@@ -16,7 +16,7 @@ import { WebRtc } from "./webrtc";
 import { createGraph } from "./graph";
 import { createPersistenceAdapter, decodeEpochMeta, encodeEpochMeta, persistenceMetaKey, } from "./persistence";
 import { EMPTY_YJS_UPDATE_MAX_BYTES, FIRESTORE_CONTENT_MAX_BYTES, contentSizeKind, } from "./firestore-limits";
-import { appendUpdate, DEFAULT_EPOCH_FIELD, DEFAULT_FOLD_BYTES_FRACTION, DEFAULT_FOLD_UPDATE_THRESHOLD, foldUpdates, isAlreadyExistsError, listUpdates, readBytes, readSnapshotMeta, snapshotMetaFromFields, updateIdFromAlreadyExistsError, updatesCollectionPath, writeSnapshot, } from "./append-store";
+import { appendUpdate, DEFAULT_EPOCH_FIELD, DEFAULT_FOLD_BYTES_FRACTION, DEFAULT_FOLD_UPDATE_THRESHOLD, foldUpdates, isAlreadyExistsError, listUpdates, readBytes, readSnapshotMeta, snapshotMetaFromFields, updateIdFromAlreadyExistsError, updatesCollectionPath, writeSnapshot, stampSnapshotMeta, } from "./append-store";
 import { enqueueTabFold } from "./fold-scheduler";
 import { mergeStateVectors, stateVectorCovers, stateVectorFromUpdate } from "./state-vector";
 /** Default budget for `appendUpdate` / first-snapshot Firestore writes. */
@@ -460,9 +460,29 @@ export class FireProvider extends ObservableV2 {
         this.applyRemoteSnapshot = (meta, hydrateGen) => __awaiter(this, void 0, void 0, function* () {
             var _d, _e;
             if (this.snapshotStore) {
-                const stored = snapshotMetaFromFields(meta);
+                let stored = snapshotMetaFromFields(meta);
+                let defaultBytes;
+                if (!stored && this.snapshotStore.readDefault) {
+                    try {
+                        const fallback = yield this.snapshotStore.readDefault({
+                            epoch: meta.epoch,
+                        });
+                        if (fallback &&
+                            fallback.bytes.byteLength > EMPTY_YJS_UPDATE_MAX_BYTES) {
+                            stored = fallback.meta;
+                            defaultBytes = fallback.bytes;
+                        }
+                    }
+                    catch (error) {
+                        this.consoleHandler("Firestore sync error", error);
+                        this.scheduleSnapshotRetry();
+                        return false;
+                    }
+                    if (hydrateGen !== this.snapshotHydrateGen)
+                        return false;
+                }
                 if (!stored) {
-                    // Missing path + empty doc: first write. Do not apply Firestore content.
+                    // Missing path + no default object: first write.
                     return hydrateGen === this.snapshotHydrateGen;
                 }
                 const skipApply = !!meta.snapshotSV &&
@@ -471,14 +491,16 @@ export class FireProvider extends ObservableV2 {
                     this.hasRemoteContent = true;
                     return hydrateGen === this.snapshotHydrateGen;
                 }
-                let bytes;
-                try {
-                    bytes = yield this.snapshotStore.read(stored);
-                }
-                catch (error) {
-                    this.consoleHandler("Firestore sync error", error);
-                    this.scheduleSnapshotRetry();
-                    return false;
+                let bytes = defaultBytes;
+                if (!bytes) {
+                    try {
+                        bytes = yield this.snapshotStore.read(stored);
+                    }
+                    catch (error) {
+                        this.consoleHandler("Firestore sync error", error);
+                        this.scheduleSnapshotRetry();
+                        return false;
+                    }
                 }
                 if (hydrateGen !== this.snapshotHydrateGen)
                     return false;
@@ -486,7 +508,18 @@ export class FireProvider extends ObservableV2 {
                 this.clearFoldBackoff();
                 this.firebaseDataLastUpdatedAt = new Date().getTime();
                 Y.applyUpdate(this.doc, bytes, "origin:firebase/update");
-                this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, (_d = meta.snapshotSV) !== null && _d !== void 0 ? _d : stateVectorFromUpdate(bytes));
+                const appliedSv = (_d = meta.snapshotSV) !== null && _d !== void 0 ? _d : stateVectorFromUpdate(bytes);
+                this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, appliedSv);
+                if (defaultBytes) {
+                    void stampSnapshotMeta({
+                        db: this.db,
+                        documentPath: this.documentPath,
+                        meta: stored,
+                        snapshotSV: appliedSv,
+                    }).catch((error) => {
+                        this.consoleHandler("stamp snapshot meta error", error);
+                    });
+                }
                 return true;
             }
             if (meta.content) {
@@ -657,6 +690,19 @@ export class FireProvider extends ObservableV2 {
                     this.sendToFirestoreQueue();
             }, this.maxFirestoreWait);
         };
+        /**
+         * Adopt snapshot bytes that already live off-Firestore (client Storage
+         * fallback after an empty hydrate). Applies as a remote update so the
+         * pack is not queued as a local first-write, and advances
+         * `lastPersistedSV` so the next save is a small `updates/*` delta.
+         */
+        this.adoptPersistedSnapshot = (bytes) => {
+            if (bytes.byteLength <= EMPTY_YJS_UPDATE_MAX_BYTES)
+                return;
+            Y.applyUpdate(this.doc, bytes, "origin:firebase/update");
+            this.hasRemoteContent = true;
+            this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, stateVectorFromUpdate(bytes));
+        };
         this.saveToFirestore = () => __awaiter(this, void 0, void 0, function* () {
             if (this.saveInFlight) {
                 this.saveQueued = true;
@@ -813,15 +859,40 @@ export class FireProvider extends ObservableV2 {
                     this.onSaveWarning(this.saveContext(localUpdate.byteLength, "size-warn"));
                 }
             }
-            const outcome = yield this.awaitWithSaveTimeout(writeSnapshot({
+            const result = yield this.awaitWithSaveTimeout(writeSnapshot({
                 db: this.db,
                 documentPath: this.documentPath,
                 content: localUpdate,
                 documentMapper: this.documentMapper,
                 snapshotStore: this.snapshotStore,
             }));
-            if (outcome === "exists") {
+            if (result.outcome === "exists") {
                 this.hasRemoteContent = true;
+                // Remote pack already on Storage. Apply it when this tab does not
+                // already cover that SV, then WAL from the remote snapshot — not
+                // a second dump, and not a stranded empty replica.
+                let remoteBytes;
+                let remoteSv = result.snapshotSV;
+                if (this.snapshotStore && result.contentStoragePath) {
+                    try {
+                        remoteBytes = yield this.snapshotStore.read({
+                            path: result.contentStoragePath,
+                        });
+                        remoteSv = remoteSv !== null && remoteSv !== void 0 ? remoteSv : stateVectorFromUpdate(remoteBytes);
+                    }
+                    catch (error) {
+                        this.consoleHandler("exists snapshot SV read error", error);
+                    }
+                }
+                if (remoteBytes &&
+                    remoteBytes.byteLength > EMPTY_YJS_UPDATE_MAX_BYTES &&
+                    (!remoteSv ||
+                        !stateVectorCovers(Y.encodeStateVector(this.doc), remoteSv))) {
+                    Y.applyUpdate(this.doc, remoteBytes, "origin:firebase/update");
+                }
+                if (remoteSv) {
+                    this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, remoteSv);
+                }
                 yield this.appendDelta(localUpdate);
                 return;
             }

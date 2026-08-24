@@ -190,6 +190,13 @@ export declare class FireProvider extends ObservableV2<any> {
      * `lastSeq` stay with the caller that already threw.
      */
     private awaitWithSaveTimeout;
+    /**
+     * Adopt snapshot bytes that already live off-Firestore (client Storage
+     * fallback after an empty hydrate). Applies as a remote update so the
+     * pack is not queued as a local first-write, and advances
+     * `lastPersistedSV` so the next save is a small `updates/*` delta.
+     */
+    adoptPersistedSnapshot: (bytes: Uint8Array) => void;
     saveToFirestore: () => Promise<void>;
     private abortSize;
     private clearFoldBackoff;

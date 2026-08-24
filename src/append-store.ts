@@ -35,6 +35,21 @@ export type SnapshotStore = {
   read(meta: SnapshotMeta): Promise<Uint8Array>;
   /** Persist snapshot bytes; may gzip internally. */
   write(bytes: Uint8Array): Promise<SnapshotMeta>;
+  /**
+   * When the shard doc has no `contentStoragePath`, try the store's
+   * conventional object for `epoch` (packed `canvas-bodies`
+   * `{contentGeneration}.yjs.gz`, then epoch 0). `null` means absent —
+   * first write. Must not throw for a missing object.
+   */
+  readDefault?(opts?: {
+    epoch?: number | null;
+  }): Promise<{ bytes: Uint8Array; meta: SnapshotMeta } | null>;
+};
+
+export type WriteSnapshotResult = {
+  outcome: "written" | "exists";
+  snapshotSV?: Uint8Array;
+  contentStoragePath?: string;
 };
 
 export function updatesCollectionPath(documentPath: string): string {
@@ -217,16 +232,60 @@ export async function listUpdates(
   return out;
 }
 
+function snapshotSvFromShardData(
+  data: Record<string, unknown> | undefined,
+): Uint8Array | undefined {
+  return readBytes(data?.[SNAPSHOT_SV_FIELD]);
+}
+
+function storagePathFromShardData(
+  data: Record<string, unknown> | undefined,
+): string | undefined {
+  const path = data?.[CONTENT_STORAGE_PATH_FIELD];
+  return typeof path === "string" && path.length > 0 ? path : undefined;
+}
+
+/**
+ * Repair a missing Storage pointer after a successful `readDefault`.
+ * Merge-only; no-ops when the shard already has a path or `content`.
+ */
+export async function stampSnapshotMeta(opts: {
+  db: Firestore;
+  documentPath: string;
+  meta: SnapshotMeta;
+  snapshotSV?: Uint8Array;
+}): Promise<void> {
+  const ref = doc(opts.db, opts.documentPath);
+  await runTransaction(opts.db, async (tx) => {
+    const snap = await tx.get(ref);
+    const data = snap.data() as Record<string, unknown> | undefined;
+    if (hasExistingSnapshot(data)) return;
+    tx.set(
+      ref,
+      {
+        ...snapshotStoreDocFields(opts.meta),
+        ...(opts.snapshotSV
+          ? { [SNAPSHOT_SV_FIELD]: Bytes.fromUint8Array(opts.snapshotSV) }
+          : {}),
+        updatedAt: serverTimestamp(),
+      },
+      { merge: true },
+    );
+  });
+}
+
 export async function writeSnapshot(opts: {
   db: Firestore;
   documentPath: string;
   content: Uint8Array;
   documentMapper: (bytes: Bytes) => object;
   snapshotStore?: SnapshotStore;
-}): Promise<"written" | "exists"> {
+}): Promise<WriteSnapshotResult> {
   const ref = doc(opts.db, opts.documentPath);
   let outcome: "written" | "exists" = "written";
   let stored: SnapshotMeta | undefined;
+  let existingSv: Uint8Array | undefined;
+  let existingPath: string | undefined;
   if (opts.snapshotStore) {
     // Peek first. Writing the store before this check clobbers an
     // Admin-packed blob when hasRemoteContent is still false (empty
@@ -234,11 +293,20 @@ export async function writeSnapshot(opts: {
     let alreadyExists = false;
     await runTransaction(opts.db, async (tx) => {
       const snap = await tx.get(ref);
-      alreadyExists = hasExistingSnapshot(
-        snap.data() as Record<string, unknown> | undefined,
-      );
+      const data = snap.data() as Record<string, unknown> | undefined;
+      alreadyExists = hasExistingSnapshot(data);
+      if (alreadyExists) {
+        existingSv = snapshotSvFromShardData(data);
+        existingPath = storagePathFromShardData(data);
+      }
     });
-    if (alreadyExists) return "exists";
+    if (alreadyExists) {
+      return {
+        outcome: "exists",
+        snapshotSV: existingSv,
+        contentStoragePath: existingPath,
+      };
+    }
     stored = await opts.snapshotStore.write(opts.content);
   }
   await runTransaction(opts.db, async (tx) => {
@@ -246,6 +314,8 @@ export async function writeSnapshot(opts: {
     const data = snap.data() as Record<string, unknown> | undefined;
     if (hasExistingSnapshot(data)) {
       outcome = "exists";
+      existingSv = snapshotSvFromShardData(data);
+      existingPath = storagePathFromShardData(data);
       return;
     }
     if (opts.snapshotStore && stored) {
@@ -274,7 +344,7 @@ export async function writeSnapshot(opts: {
       { merge: true },
     );
   });
-  return outcome;
+  return { outcome, snapshotSV: existingSv, contentStoragePath: existingPath };
 }
 
 export type FoldResult =

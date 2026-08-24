@@ -21,6 +21,23 @@ export type SnapshotStore = {
     read(meta: SnapshotMeta): Promise<Uint8Array>;
     /** Persist snapshot bytes; may gzip internally. */
     write(bytes: Uint8Array): Promise<SnapshotMeta>;
+    /**
+     * When the shard doc has no `contentStoragePath`, try the store's
+     * conventional object for `epoch` (packed `canvas-bodies`
+     * `{contentGeneration}.yjs.gz`, then epoch 0). `null` means absent —
+     * first write. Must not throw for a missing object.
+     */
+    readDefault?(opts?: {
+        epoch?: number | null;
+    }): Promise<{
+        bytes: Uint8Array;
+        meta: SnapshotMeta;
+    } | null>;
+};
+export type WriteSnapshotResult = {
+    outcome: "written" | "exists";
+    snapshotSV?: Uint8Array;
+    contentStoragePath?: string;
 };
 export declare function updatesCollectionPath(documentPath: string): string;
 export declare function isAlreadyExistsError(error: unknown): boolean;
@@ -56,13 +73,23 @@ export declare function appendUpdate(db: Firestore, documentPath: string, payloa
     clientId?: string;
 }): Promise<import("@firebase/firestore").DocumentReference<import("@firebase/firestore").DocumentData, import("@firebase/firestore").DocumentData>>;
 export declare function listUpdates(db: Firestore, documentPath: string): Promise<ListedUpdate[]>;
+/**
+ * Repair a missing Storage pointer after a successful `readDefault`.
+ * Merge-only; no-ops when the shard already has a path or `content`.
+ */
+export declare function stampSnapshotMeta(opts: {
+    db: Firestore;
+    documentPath: string;
+    meta: SnapshotMeta;
+    snapshotSV?: Uint8Array;
+}): Promise<void>;
 export declare function writeSnapshot(opts: {
     db: Firestore;
     documentPath: string;
     content: Uint8Array;
     documentMapper: (bytes: Bytes) => object;
     snapshotStore?: SnapshotStore;
-}): Promise<"written" | "exists">;
+}): Promise<WriteSnapshotResult>;
 export type FoldResult = {
     status: "ok";
     snapshot: Uint8Array;

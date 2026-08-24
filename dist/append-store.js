@@ -151,11 +151,38 @@ export function listUpdates(db, documentPath) {
         return out;
     });
 }
+function snapshotSvFromShardData(data) {
+    return readBytes(data === null || data === void 0 ? void 0 : data[SNAPSHOT_SV_FIELD]);
+}
+function storagePathFromShardData(data) {
+    const path = data === null || data === void 0 ? void 0 : data[CONTENT_STORAGE_PATH_FIELD];
+    return typeof path === "string" && path.length > 0 ? path : undefined;
+}
+/**
+ * Repair a missing Storage pointer after a successful `readDefault`.
+ * Merge-only; no-ops when the shard already has a path or `content`.
+ */
+export function stampSnapshotMeta(opts) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const ref = doc(opts.db, opts.documentPath);
+        yield runTransaction(opts.db, (tx) => __awaiter(this, void 0, void 0, function* () {
+            const snap = yield tx.get(ref);
+            const data = snap.data();
+            if (hasExistingSnapshot(data))
+                return;
+            tx.set(ref, Object.assign(Object.assign(Object.assign({}, snapshotStoreDocFields(opts.meta)), (opts.snapshotSV
+                ? { [SNAPSHOT_SV_FIELD]: Bytes.fromUint8Array(opts.snapshotSV) }
+                : {})), { updatedAt: serverTimestamp() }), { merge: true });
+        }));
+    });
+}
 export function writeSnapshot(opts) {
     return __awaiter(this, void 0, void 0, function* () {
         const ref = doc(opts.db, opts.documentPath);
         let outcome = "written";
         let stored;
+        let existingSv;
+        let existingPath;
         if (opts.snapshotStore) {
             // Peek first. Writing the store before this check clobbers an
             // Admin-packed blob when hasRemoteContent is still false (empty
@@ -163,10 +190,20 @@ export function writeSnapshot(opts) {
             let alreadyExists = false;
             yield runTransaction(opts.db, (tx) => __awaiter(this, void 0, void 0, function* () {
                 const snap = yield tx.get(ref);
-                alreadyExists = hasExistingSnapshot(snap.data());
+                const data = snap.data();
+                alreadyExists = hasExistingSnapshot(data);
+                if (alreadyExists) {
+                    existingSv = snapshotSvFromShardData(data);
+                    existingPath = storagePathFromShardData(data);
+                }
             }));
-            if (alreadyExists)
-                return "exists";
+            if (alreadyExists) {
+                return {
+                    outcome: "exists",
+                    snapshotSV: existingSv,
+                    contentStoragePath: existingPath,
+                };
+            }
             stored = yield opts.snapshotStore.write(opts.content);
         }
         yield runTransaction(opts.db, (tx) => __awaiter(this, void 0, void 0, function* () {
@@ -174,6 +211,8 @@ export function writeSnapshot(opts) {
             const data = snap.data();
             if (hasExistingSnapshot(data)) {
                 outcome = "exists";
+                existingSv = snapshotSvFromShardData(data);
+                existingPath = storagePathFromShardData(data);
                 return;
             }
             if (opts.snapshotStore && stored) {
@@ -182,7 +221,7 @@ export function writeSnapshot(opts) {
             }
             tx.set(ref, Object.assign(Object.assign({}, opts.documentMapper(Bytes.fromUint8Array(opts.content))), { [SNAPSHOT_SV_FIELD]: Bytes.fromUint8Array(Y.encodeStateVectorFromUpdate(opts.content)), updatedAt: serverTimestamp() }), { merge: true });
         }));
-        return outcome;
+        return { outcome, snapshotSV: existingSv, contentStoragePath: existingPath };
     });
 }
 export function foldUpdates(opts) {

@@ -31,11 +31,14 @@ import { FIRESTORE_CONTENT_MAX_BYTES } from "../firestore-limits";
 
 const LARGE_PAYLOAD_CHARS = Math.floor(FIRESTORE_CONTENT_MAX_BYTES * 1.5);
 
-function createMemorySnapshotStore(): {
+function createMemorySnapshotStore(opts?: {
+  defaultPath?: string;
+}): {
   blobs: Map<string, Uint8Array>;
   store: SnapshotStore;
   write: SnapshotStore["write"];
   read: SnapshotStore["read"];
+  readDefault: NonNullable<SnapshotStore["readDefault"]>;
 } {
   const blobs = new Map<string, Uint8Array>();
   const write = vi.fn(async (bytes: Uint8Array) => {
@@ -53,7 +56,21 @@ function createMemorySnapshotStore(): {
     if (!b) throw new Error("missing snapshot " + meta.path);
     return b;
   });
-  return { blobs, store: { write, read }, write, read };
+  const readDefault = vi.fn(async (args?: { epoch?: number | null }) => {
+    const candidates: string[] = [];
+    if (args?.epoch != null && args.epoch > 0) {
+      candidates.push(`snap/${args.epoch}`);
+    }
+    if (opts?.defaultPath) candidates.push(opts.defaultPath);
+    for (const path of candidates) {
+      const bytes = blobs.get(path);
+      if (bytes) {
+        return { bytes, meta: { path, rawBytes: bytes.byteLength } };
+      }
+    }
+    return null;
+  });
+  return { blobs, store: { write, read, readDefault }, write, read, readDefault };
 }
 
 function shardHasContentField(data: Record<string, unknown> | undefined) {
@@ -180,6 +197,175 @@ describe("snapshotStore persistence", () => {
     created.ydoc.getMap("bodies");
     await provider.saveToFirestore();
     expect(write).not.toHaveBeenCalled();
+  });
+
+  it("adoptPersistedSnapshot does not first-write a >1 MiB pack (empty hydrate fallback)", async () => {
+    const source = new Y.Doc();
+    source.getText("t").insert(0, "x".repeat(LARGE_PAYLOAD_CHARS));
+    const bytes = Y.encodeStateAsUpdate(source);
+    expect(bytes.byteLength).toBeGreaterThan(FIRESTORE_CONTENT_MAX_BYTES);
+
+    const { store, write } = createMemorySnapshotStore();
+    const created = await createTestProvider({ snapshotStore: store });
+    provider = created.provider;
+    const onSaveError = vi.fn();
+    provider.onSaveError = onSaveError;
+    await markServerReady(TEST_PATH);
+
+    provider.adoptPersistedSnapshot(bytes);
+    expect(created.ydoc.getText("t").toString().length).toBe(LARGE_PAYLOAD_CHARS);
+
+    await provider.saveToFirestore();
+    expect(write).not.toHaveBeenCalled();
+    expect(addDocCalls.length).toBe(0);
+    expect(
+      onSaveError.mock.calls.map((c) => (c[1] as { reason?: string })?.reason),
+    ).not.toContain("size-abort");
+
+    created.ydoc.getText("t").insert(LARGE_PAYLOAD_CHARS, "!");
+    await provider.saveToFirestore();
+    expect(write).not.toHaveBeenCalled();
+    expect(addDocCalls.length).toBe(1);
+    expect(
+      onSaveError.mock.calls.map((c) => (c[1] as { reason?: string })?.reason),
+    ).not.toContain("size-abort");
+  });
+
+  it("a local applyUpdate of a >1 MiB pack size-aborts without adoptPersistedSnapshot", async () => {
+    const source = new Y.Doc();
+    source.getText("t").insert(0, "x".repeat(LARGE_PAYLOAD_CHARS));
+    const bytes = Y.encodeStateAsUpdate(source);
+
+    const created = await createTestProvider();
+    provider = created.provider;
+    const onSaveError = vi.fn();
+    provider.onSaveError = onSaveError;
+    await markServerReady(TEST_PATH);
+
+    Y.applyUpdate(created.ydoc, bytes);
+    await provider.saveToFirestore();
+
+    expect(
+      onSaveError.mock.calls.map((c) => (c[1] as { reason?: string })?.reason),
+    ).toContain("size-abort");
+    expect(String(onSaveError.mock.calls[0]?.[0])).toContain(
+      "encoded content exceeds Firestore 1 MiB limit",
+    );
+  });
+
+  it("readDefault hydrates a >1 MiB pack when contentStoragePath is missing", async () => {
+    const source = new Y.Doc();
+    source.getText("t").insert(0, "x".repeat(LARGE_PAYLOAD_CHARS));
+    const bytes = Y.encodeStateAsUpdate(source);
+    const { store, write, blobs, readDefault } = createMemorySnapshotStore({
+      defaultPath: "snap/0",
+    });
+    blobs.set("snap/0", bytes);
+
+    const created = await createTestProvider({ snapshotStore: store });
+    provider = created.provider;
+    const onSaveError = vi.fn();
+    provider.onSaveError = onSaveError;
+    firestoreDocs.set(TEST_PATH, { contentGeneration: 1 });
+    emitServerStorageSnapshot(TEST_PATH);
+    await waitUntil(
+      () => created.ydoc.getText("t").toString().length === LARGE_PAYLOAD_CHARS,
+      "readDefault hydrate",
+    );
+    expect(readDefault).toHaveBeenCalled();
+    expect(readDefault.mock.calls[0]?.[0]).toMatchObject({ epoch: 1 });
+    await waitUntil(
+      () =>
+        typeof firestoreDocs.get(TEST_PATH)?.[CONTENT_STORAGE_PATH_FIELD] ===
+        "string",
+      "stamp contentStoragePath after readDefault",
+    );
+    expect(firestoreDocs.get(TEST_PATH)?.[CONTENT_STORAGE_PATH_FIELD]).toBe(
+      "snap/0",
+    );
+
+    await provider.saveToFirestore();
+    expect(write).not.toHaveBeenCalled();
+    expect(addDocCalls.length).toBe(0);
+    expect(
+      onSaveError.mock.calls.map((c) => (c[1] as { reason?: string })?.reason),
+    ).not.toContain("size-abort");
+
+    created.ydoc.getText("t").insert(LARGE_PAYLOAD_CHARS, "!");
+    await provider.saveToFirestore();
+    expect(write).not.toHaveBeenCalled();
+    expect(addDocCalls.length).toBe(1);
+  });
+
+  it("readDefault prefers the shard epoch object over epoch 0", async () => {
+    const stale = new Y.Doc();
+    stale.getText("t").insert(0, "stale");
+    const fresh = new Y.Doc();
+    fresh.getText("t").insert(0, "fresh-epoch");
+    const { store, blobs, readDefault } = createMemorySnapshotStore({
+      defaultPath: "snap/0",
+    });
+    blobs.set("snap/0", Y.encodeStateAsUpdate(stale));
+    blobs.set("snap/9", Y.encodeStateAsUpdate(fresh));
+
+    const created = await createTestProvider({ snapshotStore: store });
+    provider = created.provider;
+    firestoreDocs.set(TEST_PATH, { contentGeneration: 9 });
+    emitServerStorageSnapshot(TEST_PATH);
+    await waitUntil(
+      () => created.ydoc.getText("t").toString() === "fresh-epoch",
+      "readDefault hydrates the stamped epoch",
+    );
+    expect(readDefault.mock.calls[0]?.[0]).toMatchObject({ epoch: 9 });
+    stale.destroy();
+    fresh.destroy();
+  });
+
+  it("exists first-write applies the remote snapshot when local is empty", async () => {
+    const source = new Y.Doc();
+    source.getText("t").insert(0, "remote-pack");
+    const bytes = Y.encodeStateAsUpdate(source);
+    const { store, write } = createMemorySnapshotStore();
+    const created = await createTestProvider({ snapshotStore: store });
+    provider = created.provider;
+    const meta = await store.write(bytes);
+    write.mockClear();
+    seedStorageShard(TEST_PATH, meta, {
+      snapshotSV: Y.encodeStateVector(source),
+    });
+    await markServerReady(TEST_PATH);
+
+    created.ydoc.getText("t").insert(0, "local-only");
+    await provider.saveToFirestore();
+
+    expect(created.ydoc.getText("t").toString()).toContain("remote-pack");
+    expect(write).not.toHaveBeenCalled();
+    source.destroy();
+  });
+
+  it("exists first-write uses snapshotSV so a local pack apply is not a WAL dump", async () => {
+    const source = new Y.Doc();
+    source.getText("t").insert(0, "x".repeat(LARGE_PAYLOAD_CHARS));
+    const bytes = Y.encodeStateAsUpdate(source);
+    const snapshotSV = Y.encodeStateVector(source);
+    const { store, write } = createMemorySnapshotStore();
+    const created = await createTestProvider({ snapshotStore: store });
+    provider = created.provider;
+    const meta = await store.write(bytes);
+    write.mockClear();
+    seedStorageShard(TEST_PATH, meta, { snapshotSV });
+    const onSaveError = vi.fn();
+    provider.onSaveError = onSaveError;
+    await markServerReady(TEST_PATH);
+
+    Y.applyUpdate(created.ydoc, bytes);
+    await provider.saveToFirestore();
+
+    expect(write).not.toHaveBeenCalled();
+    expect(addDocCalls.length).toBe(0);
+    expect(
+      onSaveError.mock.calls.map((c) => (c[1] as { reason?: string })?.reason),
+    ).not.toContain("size-abort");
   });
 
   it("writes a ~1.5MB first snapshot via the store without a content field or size-abort", async () => {
