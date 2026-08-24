@@ -56,12 +56,19 @@ function createMemorySnapshotStore(opts?: {
     if (!b) throw new Error("missing snapshot " + meta.path);
     return b;
   });
-  const readDefault = vi.fn(async () => {
-    const path = opts?.defaultPath;
-    if (!path) return null;
-    const bytes = blobs.get(path);
-    if (!bytes) return null;
-    return { bytes, meta: { path, rawBytes: bytes.byteLength } };
+  const readDefault = vi.fn(async (args?: { epoch?: number | null }) => {
+    const candidates: string[] = [];
+    if (args?.epoch != null && args.epoch > 0) {
+      candidates.push(`snap/${args.epoch}`);
+    }
+    if (opts?.defaultPath) candidates.push(opts.defaultPath);
+    for (const path of candidates) {
+      const bytes = blobs.get(path);
+      if (bytes) {
+        return { bytes, meta: { path, rawBytes: bytes.byteLength } };
+      }
+    }
+    return null;
   });
   return { blobs, store: { write, read, readDefault }, write, read, readDefault };
 }
@@ -266,6 +273,7 @@ describe("snapshotStore persistence", () => {
       "readDefault hydrate",
     );
     expect(readDefault).toHaveBeenCalled();
+    expect(readDefault.mock.calls[0]?.[0]).toMatchObject({ epoch: 1 });
     await waitUntil(
       () =>
         typeof firestoreDocs.get(TEST_PATH)?.[CONTENT_STORAGE_PATH_FIELD] ===
@@ -287,6 +295,52 @@ describe("snapshotStore persistence", () => {
     await provider.saveToFirestore();
     expect(write).not.toHaveBeenCalled();
     expect(addDocCalls.length).toBe(1);
+  });
+
+  it("readDefault prefers the shard epoch object over epoch 0", async () => {
+    const stale = new Y.Doc();
+    stale.getText("t").insert(0, "stale");
+    const fresh = new Y.Doc();
+    fresh.getText("t").insert(0, "fresh-epoch");
+    const { store, blobs, readDefault } = createMemorySnapshotStore({
+      defaultPath: "snap/0",
+    });
+    blobs.set("snap/0", Y.encodeStateAsUpdate(stale));
+    blobs.set("snap/9", Y.encodeStateAsUpdate(fresh));
+
+    const created = await createTestProvider({ snapshotStore: store });
+    provider = created.provider;
+    firestoreDocs.set(TEST_PATH, { contentGeneration: 9 });
+    emitServerStorageSnapshot(TEST_PATH);
+    await waitUntil(
+      () => created.ydoc.getText("t").toString() === "fresh-epoch",
+      "readDefault hydrates the stamped epoch",
+    );
+    expect(readDefault.mock.calls[0]?.[0]).toMatchObject({ epoch: 9 });
+    stale.destroy();
+    fresh.destroy();
+  });
+
+  it("exists first-write applies the remote snapshot when local is empty", async () => {
+    const source = new Y.Doc();
+    source.getText("t").insert(0, "remote-pack");
+    const bytes = Y.encodeStateAsUpdate(source);
+    const { store, write } = createMemorySnapshotStore();
+    const created = await createTestProvider({ snapshotStore: store });
+    provider = created.provider;
+    const meta = await store.write(bytes);
+    write.mockClear();
+    seedStorageShard(TEST_PATH, meta, {
+      snapshotSV: Y.encodeStateVector(source),
+    });
+    await markServerReady(TEST_PATH);
+
+    created.ydoc.getText("t").insert(0, "local-only");
+    await provider.saveToFirestore();
+
+    expect(created.ydoc.getText("t").toString()).toContain("remote-pack");
+    expect(write).not.toHaveBeenCalled();
+    source.destroy();
   });
 
   it("exists first-write uses snapshotSV so a local pack apply is not a WAL dump", async () => {

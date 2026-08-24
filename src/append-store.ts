@@ -37,10 +37,13 @@ export type SnapshotStore = {
   write(bytes: Uint8Array): Promise<SnapshotMeta>;
   /**
    * When the shard doc has no `contentStoragePath`, try the store's
-   * conventional object (e.g. packed `canvas-bodies` epoch 0). `null`
-   * means absent — first write. Must not throw for a missing object.
+   * conventional object for `epoch` (packed `canvas-bodies`
+   * `{contentGeneration}.yjs.gz`, then epoch 0). `null` means absent —
+   * first write. Must not throw for a missing object.
    */
-  readDefault?(): Promise<{ bytes: Uint8Array; meta: SnapshotMeta } | null>;
+  readDefault?(opts?: {
+    epoch?: number | null;
+  }): Promise<{ bytes: Uint8Array; meta: SnapshotMeta } | null>;
 };
 
 export type WriteSnapshotResult = {

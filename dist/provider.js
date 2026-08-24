@@ -464,7 +464,9 @@ export class FireProvider extends ObservableV2 {
                 let defaultBytes;
                 if (!stored && this.snapshotStore.readDefault) {
                     try {
-                        const fallback = yield this.snapshotStore.readDefault();
+                        const fallback = yield this.snapshotStore.readDefault({
+                            epoch: meta.epoch,
+                        });
                         if (fallback &&
                             fallback.bytes.byteLength > EMPTY_YJS_UPDATE_MAX_BYTES) {
                             stored = fallback.meta;
@@ -866,21 +868,27 @@ export class FireProvider extends ObservableV2 {
             }));
             if (result.outcome === "exists") {
                 this.hasRemoteContent = true;
-                // Remote pack already on Storage. Use its SV (field, else read
-                // the blob) so appendDelta is a real WAL, not a second dump.
+                // Remote pack already on Storage. Apply it when this tab does not
+                // already cover that SV, then WAL from the remote snapshot — not
+                // a second dump, and not a stranded empty replica.
+                let remoteBytes;
                 let remoteSv = result.snapshotSV;
-                if (!remoteSv &&
-                    this.snapshotStore &&
-                    result.contentStoragePath) {
+                if (this.snapshotStore && result.contentStoragePath) {
                     try {
-                        const remote = yield this.snapshotStore.read({
+                        remoteBytes = yield this.snapshotStore.read({
                             path: result.contentStoragePath,
                         });
-                        remoteSv = stateVectorFromUpdate(remote);
+                        remoteSv = remoteSv !== null && remoteSv !== void 0 ? remoteSv : stateVectorFromUpdate(remoteBytes);
                     }
                     catch (error) {
                         this.consoleHandler("exists snapshot SV read error", error);
                     }
+                }
+                if (remoteBytes &&
+                    remoteBytes.byteLength > EMPTY_YJS_UPDATE_MAX_BYTES &&
+                    (!remoteSv ||
+                        !stateVectorCovers(Y.encodeStateVector(this.doc), remoteSv))) {
+                    Y.applyUpdate(this.doc, remoteBytes, "origin:firebase/update");
                 }
                 if (remoteSv) {
                     this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, remoteSv);
