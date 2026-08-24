@@ -2,8 +2,26 @@ import { Bytes, Firestore } from "@firebase/firestore";
 export declare const UPDATES_SUBCOLLECTION = "updates";
 export declare const DEFAULT_EPOCH_FIELD = "contentGeneration";
 export declare const SNAPSHOT_SV_FIELD = "snapshotSV";
+export declare const SNAPSHOT_BACKEND_FIELD = "snapshotBackend";
+export declare const CONTENT_STORAGE_PATH_FIELD = "contentStoragePath";
+export declare const CONTENT_STORAGE_GENERATION_FIELD = "contentStorageGeneration";
+export declare const CONTENT_GZIP_BYTES_FIELD = "contentGzipBytes";
+export declare const CONTENT_RAW_BYTES_FIELD = "contentRawBytes";
+export declare const SNAPSHOT_BACKEND_STORAGE = "storage";
 export declare const DEFAULT_FOLD_UPDATE_THRESHOLD = 20;
 export declare const DEFAULT_FOLD_BYTES_FRACTION = 0.5;
+export type SnapshotMeta = {
+    path: string;
+    generation?: string;
+    gzipBytes?: number;
+    rawBytes?: number;
+};
+export type SnapshotStore = {
+    /** Return inflated Yjs update bytes (Y.encodeStateAsUpdate). */
+    read(meta: SnapshotMeta): Promise<Uint8Array>;
+    /** Persist snapshot bytes; may gzip internally. */
+    write(bytes: Uint8Array): Promise<SnapshotMeta>;
+};
 export declare function updatesCollectionPath(documentPath: string): string;
 export declare function isAlreadyExistsError(error: unknown): boolean;
 export declare function updateIdFromAlreadyExistsError(error: unknown): string | undefined;
@@ -12,7 +30,19 @@ export declare function readSnapshotMeta(data: Record<string, unknown> | undefin
     content?: Uint8Array;
     snapshotSV?: Uint8Array;
     epoch: number;
+    snapshotBackend?: string;
+    contentStoragePath?: string;
+    contentStorageGeneration?: string;
+    contentGzipBytes?: number;
+    contentRawBytes?: number;
 };
+export declare function snapshotMetaFromFields(meta: {
+    contentStoragePath?: string;
+    contentStorageGeneration?: string;
+    contentGzipBytes?: number;
+    contentRawBytes?: number;
+}): SnapshotMeta | undefined;
+export declare function snapshotStoreDocFields(meta: SnapshotMeta): Record<string, unknown>;
 export type ListedUpdate = {
     id: string;
     update: Uint8Array;
@@ -31,6 +61,7 @@ export declare function writeSnapshot(opts: {
     documentPath: string;
     content: Uint8Array;
     documentMapper: (bytes: Bytes) => object;
+    snapshotStore?: SnapshotStore;
 }): Promise<"written" | "exists">;
 export type FoldResult = {
     status: "ok";
@@ -51,5 +82,6 @@ export declare function foldUpdates(opts: {
     documentMapper: (bytes: Bytes) => object;
     maxContentBytes: number;
     force?: boolean;
+    snapshotStore?: SnapshotStore;
 }): Promise<FoldResult>;
 //# sourceMappingURL=append-store.d.ts.map

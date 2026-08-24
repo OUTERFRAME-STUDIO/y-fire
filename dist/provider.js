@@ -16,7 +16,7 @@ import { WebRtc } from "./webrtc";
 import { createGraph } from "./graph";
 import { createPersistenceAdapter, decodeEpochMeta, encodeEpochMeta, persistenceMetaKey, } from "./persistence";
 import { EMPTY_YJS_UPDATE_MAX_BYTES, FIRESTORE_CONTENT_MAX_BYTES, contentSizeKind, } from "./firestore-limits";
-import { appendUpdate, DEFAULT_EPOCH_FIELD, DEFAULT_FOLD_BYTES_FRACTION, DEFAULT_FOLD_UPDATE_THRESHOLD, foldUpdates, isAlreadyExistsError, listUpdates, readBytes, readSnapshotMeta, updateIdFromAlreadyExistsError, updatesCollectionPath, writeSnapshot, } from "./append-store";
+import { appendUpdate, DEFAULT_EPOCH_FIELD, DEFAULT_FOLD_BYTES_FRACTION, DEFAULT_FOLD_UPDATE_THRESHOLD, foldUpdates, isAlreadyExistsError, listUpdates, readBytes, readSnapshotMeta, snapshotMetaFromFields, updateIdFromAlreadyExistsError, updatesCollectionPath, writeSnapshot, } from "./append-store";
 import { enqueueTabFold } from "./fold-scheduler";
 import { mergeStateVectors, stateVectorCovers, stateVectorFromUpdate } from "./state-vector";
 /** Default budget for `appendUpdate` / first-snapshot Firestore writes. */
@@ -148,7 +148,7 @@ export class FireProvider extends ObservableV2 {
             _super.destroy.call(this);
         });
     }
-    constructor({ firebaseApp, ydoc, path, docMapper, maxUpdatesThreshold, maxWaitTime, maxWaitFirestoreTime, maxFirestoreDeferral, persistence, maxContentBytes, foldUpdateThreshold, foldBytesFraction, epochField, saveTimeoutMs, }) {
+    constructor({ firebaseApp, ydoc, path, docMapper, maxUpdatesThreshold, maxWaitTime, maxWaitFirestoreTime, maxFirestoreDeferral, persistence, maxContentBytes, foldUpdateThreshold, foldBytesFraction, epochField, saveTimeoutMs, snapshotStore, }) {
         super();
         this.timeOffset = 0; // offset to server time in mili seconds
         this.clients = [];
@@ -193,6 +193,7 @@ export class FireProvider extends ObservableV2 {
         this.foldAbortReported = false;
         this.updatesAccessDenied = false;
         this.updatesDeniedWarned = false;
+        this.snapshotHydrateGen = 0;
         this.ready = false;
         this.serverReady = false;
         this.init = () => __awaiter(this, void 0, void 0, function* () {
@@ -342,49 +343,10 @@ export class FireProvider extends ObservableV2 {
             }
             this.dataListenerPaused = false;
             const unsubDoc = onSnapshot(doc(this.db, this.documentPath), { includeMetadataChanges: true }, (snap) => {
-                var _a, _b;
-                this.snapshotRetryAttempt = 0;
-                const fromCache = ((_a = snap.metadata) === null || _a === void 0 ? void 0 : _a.fromCache) === true;
-                this.lastSnapshotFromCache = fromCache;
-                if (snap.exists()) {
-                    const data = snap.data();
-                    const meta = readSnapshotMeta(data, this.epochField);
-                    if (this.hydratedEpoch !== undefined &&
-                        meta.epoch > this.hydratedEpoch) {
-                        if (!this.epochReplaced) {
-                            const from = this.hydratedEpoch;
-                            this.epochReplaced = true;
-                            void this.deleteLocal();
-                            if (this.onEpochReplace) {
-                                this.onEpochReplace({ from, to: meta.epoch });
-                            }
-                        }
-                    }
-                    else {
-                        if (meta.content) {
-                            this.hasRemoteContent = true;
-                            const skipApply = !!meta.snapshotSV &&
-                                stateVectorCovers(this.lastPersistedSV, meta.snapshotSV);
-                            if (!skipApply) {
-                                this.clearFoldBackoff();
-                                this.firebaseDataLastUpdatedAt = new Date().getTime();
-                                Y.applyUpdate(this.doc, meta.content, "origin:firebase/update");
-                                this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, (_b = meta.snapshotSV) !== null && _b !== void 0 ? _b : stateVectorFromUpdate(meta.content));
-                            }
-                        }
-                        this.hydratedEpoch = meta.epoch;
-                    }
-                    if (!this.ready) {
-                        if (this.onReady) {
-                            this.onReady();
-                            this.ready = true;
-                        }
-                    }
-                }
-                if (!fromCache) {
-                    this.docServerSnapshot = true;
-                    this.maybeBecomeServerReady();
-                }
+                void this.handleDocSnapshot(snap).catch((error) => {
+                    this.consoleHandler("Firestore sync error", error);
+                    this.scheduleSnapshotRetry();
+                });
             }, (error) => {
                 this.consoleHandler("Firestore sync error", error);
                 if (error.code === "permission-denied") {
@@ -444,10 +406,102 @@ export class FireProvider extends ObservableV2 {
                 this.scheduleSnapshotRetry();
             });
             this.unsubscribeData = () => {
+                this.snapshotHydrateGen++;
                 unsubDoc();
                 unsubUpdates();
             };
         };
+        this.handleDocSnapshot = (snap) => __awaiter(this, void 0, void 0, function* () {
+            var _c;
+            const hydrateGen = ++this.snapshotHydrateGen;
+            this.snapshotRetryAttempt = 0;
+            const fromCache = ((_c = snap.metadata) === null || _c === void 0 ? void 0 : _c.fromCache) === true;
+            this.lastSnapshotFromCache = fromCache;
+            if (snap.exists()) {
+                const data = snap.data();
+                const meta = readSnapshotMeta(data, this.epochField);
+                if (this.hydratedEpoch !== undefined &&
+                    meta.epoch > this.hydratedEpoch) {
+                    if (!this.epochReplaced) {
+                        const from = this.hydratedEpoch;
+                        this.epochReplaced = true;
+                        void this.deleteLocal();
+                        if (this.onEpochReplace) {
+                            this.onEpochReplace({ from, to: meta.epoch });
+                        }
+                    }
+                }
+                else {
+                    const applied = yield this.applyRemoteSnapshot(meta, hydrateGen);
+                    if (!applied)
+                        return;
+                    this.hydratedEpoch = meta.epoch;
+                }
+                if (hydrateGen !== this.snapshotHydrateGen)
+                    return;
+                if (!this.ready) {
+                    if (this.onReady) {
+                        this.onReady();
+                        this.ready = true;
+                    }
+                }
+            }
+            if (hydrateGen !== this.snapshotHydrateGen)
+                return;
+            if (!fromCache) {
+                this.docServerSnapshot = true;
+                this.maybeBecomeServerReady();
+            }
+        });
+        /**
+         * Apply remote snapshot bytes. Returns false when a storage read failed
+         * (retry scheduled) or a newer snapshot superseded this one.
+         */
+        this.applyRemoteSnapshot = (meta, hydrateGen) => __awaiter(this, void 0, void 0, function* () {
+            var _d, _e;
+            if (this.snapshotStore) {
+                const stored = snapshotMetaFromFields(meta);
+                if (!stored) {
+                    // Missing path + empty doc: first write. Do not apply Firestore content.
+                    return hydrateGen === this.snapshotHydrateGen;
+                }
+                const skipApply = !!meta.snapshotSV &&
+                    stateVectorCovers(this.lastPersistedSV, meta.snapshotSV);
+                if (skipApply) {
+                    this.hasRemoteContent = true;
+                    return hydrateGen === this.snapshotHydrateGen;
+                }
+                let bytes;
+                try {
+                    bytes = yield this.snapshotStore.read(stored);
+                }
+                catch (error) {
+                    this.consoleHandler("Firestore sync error", error);
+                    this.scheduleSnapshotRetry();
+                    return false;
+                }
+                if (hydrateGen !== this.snapshotHydrateGen)
+                    return false;
+                this.hasRemoteContent = true;
+                this.clearFoldBackoff();
+                this.firebaseDataLastUpdatedAt = new Date().getTime();
+                Y.applyUpdate(this.doc, bytes, "origin:firebase/update");
+                this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, (_d = meta.snapshotSV) !== null && _d !== void 0 ? _d : stateVectorFromUpdate(bytes));
+                return true;
+            }
+            if (meta.content) {
+                this.hasRemoteContent = true;
+                const skipApply = !!meta.snapshotSV &&
+                    stateVectorCovers(this.lastPersistedSV, meta.snapshotSV);
+                if (!skipApply) {
+                    this.clearFoldBackoff();
+                    this.firebaseDataLastUpdatedAt = new Date().getTime();
+                    Y.applyUpdate(this.doc, meta.content, "origin:firebase/update");
+                    this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, (_e = meta.snapshotSV) !== null && _e !== void 0 ? _e : stateVectorFromUpdate(meta.content));
+                }
+            }
+            return true;
+        });
         this.trackMesh = () => {
             if (this.unsubscribeMesh)
                 this.unsubscribeMesh();
@@ -738,6 +792,7 @@ export class FireProvider extends ObservableV2 {
                 documentMapper: this.documentMapper,
                 maxContentBytes: this.maxContentBytes,
                 force: true,
+                snapshotStore: this.snapshotStore,
             });
             if (fold.status === "abort") {
                 this.beginFoldBackoff();
@@ -749,18 +804,21 @@ export class FireProvider extends ObservableV2 {
         });
         this.writeFirstSnapshot = (localUpdate) => __awaiter(this, void 0, void 0, function* () {
             const svAtEncode = Y.encodeStateVector(this.doc);
-            const kind = contentSizeKind(localUpdate.byteLength, this.maxContentBytes);
-            if (kind === "abort") {
-                this.abortSize(localUpdate.byteLength, "y-fire: encoded content exceeds Firestore 1 MiB limit");
-            }
-            if (kind === "warn" && this.onSaveWarning) {
-                this.onSaveWarning(this.saveContext(localUpdate.byteLength, "size-warn"));
+            if (!this.snapshotStore) {
+                const kind = contentSizeKind(localUpdate.byteLength, this.maxContentBytes);
+                if (kind === "abort") {
+                    this.abortSize(localUpdate.byteLength, "y-fire: encoded content exceeds Firestore 1 MiB limit");
+                }
+                if (kind === "warn" && this.onSaveWarning) {
+                    this.onSaveWarning(this.saveContext(localUpdate.byteLength, "size-warn"));
+                }
             }
             const outcome = yield this.awaitWithSaveTimeout(writeSnapshot({
                 db: this.db,
                 documentPath: this.documentPath,
                 content: localUpdate,
                 documentMapper: this.documentMapper,
+                snapshotStore: this.snapshotStore,
             }));
             if (outcome === "exists") {
                 this.hasRemoteContent = true;
@@ -849,6 +907,7 @@ export class FireProvider extends ObservableV2 {
                     localUpdate,
                     documentMapper: this.documentMapper,
                     maxContentBytes: this.maxContentBytes,
+                    snapshotStore: this.snapshotStore,
                 });
                 if (fold.status === "abort") {
                     this.beginFoldBackoff();
@@ -1033,6 +1092,8 @@ export class FireProvider extends ObservableV2 {
             this.epochField = epochField;
         if (saveTimeoutMs !== undefined)
             this.saveTimeoutMs = saveTimeoutMs;
+        if (snapshotStore)
+            this.snapshotStore = snapshotStore;
         this.persistenceMode = persistence !== null && persistence !== void 0 ? persistence : "indexeddb";
         this.persistenceAdapter = createPersistenceAdapter(this.persistenceMode);
         this.awareness = new awarenessProtocol.Awareness(this.doc);
