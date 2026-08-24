@@ -525,9 +525,27 @@ export class FireProvider extends ObservableV2<any> {
     hydrateGen: number,
   ): Promise<boolean> => {
     if (this.snapshotStore) {
-      const stored = snapshotMetaFromFields(meta);
+      let stored = snapshotMetaFromFields(meta);
+      let defaultBytes: Uint8Array | undefined;
+      if (!stored && this.snapshotStore.readDefault) {
+        try {
+          const fallback = await this.snapshotStore.readDefault();
+          if (
+            fallback &&
+            fallback.bytes.byteLength > EMPTY_YJS_UPDATE_MAX_BYTES
+          ) {
+            stored = fallback.meta;
+            defaultBytes = fallback.bytes;
+          }
+        } catch (error) {
+          this.consoleHandler("Firestore sync error", error);
+          this.scheduleSnapshotRetry();
+          return false;
+        }
+        if (hydrateGen !== this.snapshotHydrateGen) return false;
+      }
       if (!stored) {
-        // Missing path + empty doc: first write. Do not apply Firestore content.
+        // Missing path + no default object: first write.
         return hydrateGen === this.snapshotHydrateGen;
       }
       const skipApply =
@@ -537,13 +555,15 @@ export class FireProvider extends ObservableV2<any> {
         this.hasRemoteContent = true;
         return hydrateGen === this.snapshotHydrateGen;
       }
-      let bytes: Uint8Array;
-      try {
-        bytes = await this.snapshotStore.read(stored);
-      } catch (error) {
-        this.consoleHandler("Firestore sync error", error);
-        this.scheduleSnapshotRetry();
-        return false;
+      let bytes = defaultBytes;
+      if (!bytes) {
+        try {
+          bytes = await this.snapshotStore.read(stored);
+        } catch (error) {
+          this.consoleHandler("Firestore sync error", error);
+          this.scheduleSnapshotRetry();
+          return false;
+        }
       }
       if (hydrateGen !== this.snapshotHydrateGen) return false;
       this.hasRemoteContent = true;
@@ -1007,7 +1027,7 @@ export class FireProvider extends ObservableV2<any> {
         this.onSaveWarning(this.saveContext(localUpdate.byteLength, "size-warn"));
       }
     }
-    const outcome = await this.awaitWithSaveTimeout(
+    const result = await this.awaitWithSaveTimeout(
       writeSnapshot({
         db: this.db,
         documentPath: this.documentPath,
@@ -1016,8 +1036,16 @@ export class FireProvider extends ObservableV2<any> {
         snapshotStore: this.snapshotStore,
       }),
     );
-    if (outcome === "exists") {
+    if (result.outcome === "exists") {
       this.hasRemoteContent = true;
+      // Same pack already on Storage: advance SV so appendDelta is a
+      // real WAL, not a second encode of the whole snapshot.
+      if (result.snapshotSV) {
+        this.lastPersistedSV = mergeStateVectors(
+          this.lastPersistedSV,
+          result.snapshotSV,
+        );
+      }
       await this.appendDelta(localUpdate);
       return;
     }

@@ -35,6 +35,17 @@ export type SnapshotStore = {
   read(meta: SnapshotMeta): Promise<Uint8Array>;
   /** Persist snapshot bytes; may gzip internally. */
   write(bytes: Uint8Array): Promise<SnapshotMeta>;
+  /**
+   * When the shard doc has no `contentStoragePath`, try the store's
+   * conventional object (e.g. packed `canvas-bodies` epoch 0). `null`
+   * means absent — first write. Must not throw for a missing object.
+   */
+  readDefault?(): Promise<{ bytes: Uint8Array; meta: SnapshotMeta } | null>;
+};
+
+export type WriteSnapshotResult = {
+  outcome: "written" | "exists";
+  snapshotSV?: Uint8Array;
 };
 
 export function updatesCollectionPath(documentPath: string): string {
@@ -217,16 +228,23 @@ export async function listUpdates(
   return out;
 }
 
+function snapshotSvFromShardData(
+  data: Record<string, unknown> | undefined,
+): Uint8Array | undefined {
+  return readBytes(data?.[SNAPSHOT_SV_FIELD]);
+}
+
 export async function writeSnapshot(opts: {
   db: Firestore;
   documentPath: string;
   content: Uint8Array;
   documentMapper: (bytes: Bytes) => object;
   snapshotStore?: SnapshotStore;
-}): Promise<"written" | "exists"> {
+}): Promise<WriteSnapshotResult> {
   const ref = doc(opts.db, opts.documentPath);
   let outcome: "written" | "exists" = "written";
   let stored: SnapshotMeta | undefined;
+  let existingSv: Uint8Array | undefined;
   if (opts.snapshotStore) {
     // Peek first. Writing the store before this check clobbers an
     // Admin-packed blob when hasRemoteContent is still false (empty
@@ -234,11 +252,11 @@ export async function writeSnapshot(opts: {
     let alreadyExists = false;
     await runTransaction(opts.db, async (tx) => {
       const snap = await tx.get(ref);
-      alreadyExists = hasExistingSnapshot(
-        snap.data() as Record<string, unknown> | undefined,
-      );
+      const data = snap.data() as Record<string, unknown> | undefined;
+      alreadyExists = hasExistingSnapshot(data);
+      if (alreadyExists) existingSv = snapshotSvFromShardData(data);
     });
-    if (alreadyExists) return "exists";
+    if (alreadyExists) return { outcome: "exists", snapshotSV: existingSv };
     stored = await opts.snapshotStore.write(opts.content);
   }
   await runTransaction(opts.db, async (tx) => {
@@ -246,6 +264,7 @@ export async function writeSnapshot(opts: {
     const data = snap.data() as Record<string, unknown> | undefined;
     if (hasExistingSnapshot(data)) {
       outcome = "exists";
+      existingSv = snapshotSvFromShardData(data);
       return;
     }
     if (opts.snapshotStore && stored) {
@@ -274,7 +293,7 @@ export async function writeSnapshot(opts: {
       { merge: true },
     );
   });
-  return outcome;
+  return { outcome, snapshotSV: existingSv };
 }
 
 export type FoldResult =

@@ -21,6 +21,19 @@ export type SnapshotStore = {
     read(meta: SnapshotMeta): Promise<Uint8Array>;
     /** Persist snapshot bytes; may gzip internally. */
     write(bytes: Uint8Array): Promise<SnapshotMeta>;
+    /**
+     * When the shard doc has no `contentStoragePath`, try the store's
+     * conventional object (e.g. packed `canvas-bodies` epoch 0). `null`
+     * means absent — first write. Must not throw for a missing object.
+     */
+    readDefault?(): Promise<{
+        bytes: Uint8Array;
+        meta: SnapshotMeta;
+    } | null>;
+};
+export type WriteSnapshotResult = {
+    outcome: "written" | "exists";
+    snapshotSV?: Uint8Array;
 };
 export declare function updatesCollectionPath(documentPath: string): string;
 export declare function isAlreadyExistsError(error: unknown): boolean;
@@ -62,7 +75,7 @@ export declare function writeSnapshot(opts: {
     content: Uint8Array;
     documentMapper: (bytes: Bytes) => object;
     snapshotStore?: SnapshotStore;
-}): Promise<"written" | "exists">;
+}): Promise<WriteSnapshotResult>;
 export type FoldResult = {
     status: "ok";
     snapshot: Uint8Array;

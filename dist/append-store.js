@@ -151,11 +151,15 @@ export function listUpdates(db, documentPath) {
         return out;
     });
 }
+function snapshotSvFromShardData(data) {
+    return readBytes(data === null || data === void 0 ? void 0 : data[SNAPSHOT_SV_FIELD]);
+}
 export function writeSnapshot(opts) {
     return __awaiter(this, void 0, void 0, function* () {
         const ref = doc(opts.db, opts.documentPath);
         let outcome = "written";
         let stored;
+        let existingSv;
         if (opts.snapshotStore) {
             // Peek first. Writing the store before this check clobbers an
             // Admin-packed blob when hasRemoteContent is still false (empty
@@ -163,10 +167,13 @@ export function writeSnapshot(opts) {
             let alreadyExists = false;
             yield runTransaction(opts.db, (tx) => __awaiter(this, void 0, void 0, function* () {
                 const snap = yield tx.get(ref);
-                alreadyExists = hasExistingSnapshot(snap.data());
+                const data = snap.data();
+                alreadyExists = hasExistingSnapshot(data);
+                if (alreadyExists)
+                    existingSv = snapshotSvFromShardData(data);
             }));
             if (alreadyExists)
-                return "exists";
+                return { outcome: "exists", snapshotSV: existingSv };
             stored = yield opts.snapshotStore.write(opts.content);
         }
         yield runTransaction(opts.db, (tx) => __awaiter(this, void 0, void 0, function* () {
@@ -174,6 +181,7 @@ export function writeSnapshot(opts) {
             const data = snap.data();
             if (hasExistingSnapshot(data)) {
                 outcome = "exists";
+                existingSv = snapshotSvFromShardData(data);
                 return;
             }
             if (opts.snapshotStore && stored) {
@@ -182,7 +190,7 @@ export function writeSnapshot(opts) {
             }
             tx.set(ref, Object.assign(Object.assign({}, opts.documentMapper(Bytes.fromUint8Array(opts.content))), { [SNAPSHOT_SV_FIELD]: Bytes.fromUint8Array(Y.encodeStateVectorFromUpdate(opts.content)), updatedAt: serverTimestamp() }), { merge: true });
         }));
-        return outcome;
+        return { outcome, snapshotSV: existingSv };
     });
 }
 export function foldUpdates(opts) {
