@@ -317,11 +317,11 @@ export const addDoc = vi.fn(async (ref: MockRef, data: unknown) => {
   }
   assertNoUndefinedFields(data);
   const id = `auto_${++autoIdCounter}`;
+  addDocCalls.push({ ref, data, id });
+  await addDocImpl();
   const col = getOrCreateCollection(ref.path);
   col.set(id, (data ?? {}) as Record<string, unknown>);
-  addDocCalls.push({ ref, data, id });
   notifyCollection(ref.path);
-  await addDocImpl();
   return { id, path: `${ref.path}/${id}` };
 });
 

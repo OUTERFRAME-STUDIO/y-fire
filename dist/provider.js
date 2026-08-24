@@ -19,6 +19,8 @@ import { EMPTY_YJS_UPDATE_MAX_BYTES, FIRESTORE_CONTENT_MAX_BYTES, contentSizeKin
 import { appendUpdate, DEFAULT_EPOCH_FIELD, DEFAULT_FOLD_BYTES_FRACTION, DEFAULT_FOLD_UPDATE_THRESHOLD, foldUpdates, isAlreadyExistsError, listUpdates, readBytes, readSnapshotMeta, updateIdFromAlreadyExistsError, updatesCollectionPath, writeSnapshot, } from "./append-store";
 import { enqueueTabFold } from "./fold-scheduler";
 import { mergeStateVectors, stateVectorCovers, stateVectorFromUpdate } from "./state-vector";
+/** Default budget for `appendUpdate` / first-snapshot Firestore writes. */
+export const DEFAULT_SAVE_TIMEOUT_MS = 15000;
 const SNAPSHOT_BACKOFF_BASE_MS = 500;
 const SNAPSHOT_BACKOFF_MAX_MS = 16000;
 const FOLD_BACKOFF_MS = 30000;
@@ -50,6 +52,40 @@ export class FireProvider extends ObservableV2 {
             reason,
         };
     }
+    /**
+     * Race a Firestore write against {@link saveTimeoutMs}. On timeout the
+     * underlying promise is left running (Firestore cannot cancel `addDoc`);
+     * a dangling `.then` swallows the late result so `lastPersistedSV` /
+     * `lastSeq` stay with the caller that already threw.
+     */
+    awaitWithSaveTimeout(work) {
+        return new Promise((resolve, reject) => {
+            let settled = false;
+            const timer = setTimeout(() => {
+                if (settled)
+                    return;
+                settled = true;
+                void work.then(() => undefined, () => undefined);
+                reject(Object.assign(new Error("y-fire: Firestore save timed out"), {
+                    reason: "save-timeout",
+                }));
+            }, this.saveTimeoutMs);
+            work.then((value) => {
+                if (settled)
+                    return;
+                settled = true;
+                clearTimeout(timer);
+                resolve(value);
+            }, (error) => {
+                if (settled)
+                    return;
+                settled = true;
+                clearTimeout(timer);
+                reject(error);
+            });
+        });
+    }
+    ;
     kill(keepReadOnly = false) {
         const _super = Object.create(null, {
             destroy: { get: () => super.destroy }
@@ -112,7 +148,7 @@ export class FireProvider extends ObservableV2 {
             _super.destroy.call(this);
         });
     }
-    constructor({ firebaseApp, ydoc, path, docMapper, maxUpdatesThreshold, maxWaitTime, maxWaitFirestoreTime, maxFirestoreDeferral, persistence, maxContentBytes, foldUpdateThreshold, foldBytesFraction, epochField, }) {
+    constructor({ firebaseApp, ydoc, path, docMapper, maxUpdatesThreshold, maxWaitTime, maxWaitFirestoreTime, maxFirestoreDeferral, persistence, maxContentBytes, foldUpdateThreshold, foldBytesFraction, epochField, saveTimeoutMs, }) {
         super();
         this.timeOffset = 0; // offset to server time in mili seconds
         this.clients = [];
@@ -129,6 +165,7 @@ export class FireProvider extends ObservableV2 {
         this.maxFirestoreWait = 3000;
         this.maxFirestoreDeferral = 10000;
         this.maxContentBytes = FIRESTORE_CONTENT_MAX_BYTES;
+        this.saveTimeoutMs = DEFAULT_SAVE_TIMEOUT_MS;
         this.saveInFlight = false;
         this.lastSaveDurationMs = null;
         this.saveQueued = false;
@@ -618,8 +655,9 @@ export class FireProvider extends ObservableV2 {
                     const code = error && typeof error === "object" && "code" in error
                         ? String(error.code)
                         : undefined;
+                    const saveReason = reason === "save-timeout" ? "save-timeout" : "save-failed";
                     if (this.onSaveError) {
-                        this.onSaveError(error, this.saveContext(localUpdate.byteLength, "save-failed", { code }));
+                        this.onSaveError(error, this.saveContext(localUpdate.byteLength, saveReason, { code }));
                     }
                     this.scheduleSaveRetry();
                 }
@@ -718,12 +756,12 @@ export class FireProvider extends ObservableV2 {
             if (kind === "warn" && this.onSaveWarning) {
                 this.onSaveWarning(this.saveContext(localUpdate.byteLength, "size-warn"));
             }
-            const outcome = yield writeSnapshot({
+            const outcome = yield this.awaitWithSaveTimeout(writeSnapshot({
                 db: this.db,
                 documentPath: this.documentPath,
                 content: localUpdate,
                 documentMapper: this.documentMapper,
-            });
+            }));
             if (outcome === "exists") {
                 this.hasRemoteContent = true;
                 yield this.appendDelta(localUpdate);
@@ -750,11 +788,11 @@ export class FireProvider extends ObservableV2 {
             const seq = this.lastSeq + 1;
             let result;
             try {
-                result = yield appendUpdate(this.db, this.documentPath, {
+                result = yield this.awaitWithSaveTimeout(appendUpdate(this.db, this.documentPath, {
                     update: delta,
                     seq,
                     clientId: this.uid,
-                });
+                }));
             }
             catch (error) {
                 // Create already committed / lost ack.
@@ -993,6 +1031,8 @@ export class FireProvider extends ObservableV2 {
             this.foldBytesFraction = foldBytesFraction;
         if (epochField)
             this.epochField = epochField;
+        if (saveTimeoutMs !== undefined)
+            this.saveTimeoutMs = saveTimeoutMs;
         this.persistenceMode = persistence !== null && persistence !== void 0 ? persistence : "indexeddb";
         this.persistenceAdapter = createPersistenceAdapter(this.persistenceMode);
         this.awareness = new awarenessProtocol.Awareness(this.doc);
