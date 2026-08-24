@@ -266,6 +266,15 @@ describe("snapshotStore persistence", () => {
       "readDefault hydrate",
     );
     expect(readDefault).toHaveBeenCalled();
+    await waitUntil(
+      () =>
+        typeof firestoreDocs.get(TEST_PATH)?.[CONTENT_STORAGE_PATH_FIELD] ===
+        "string",
+      "stamp contentStoragePath after readDefault",
+    );
+    expect(firestoreDocs.get(TEST_PATH)?.[CONTENT_STORAGE_PATH_FIELD]).toBe(
+      "snap/0",
+    );
 
     await provider.saveToFirestore();
     expect(write).not.toHaveBeenCalled();

@@ -41,6 +41,7 @@ import {
   updateIdFromAlreadyExistsError,
   updatesCollectionPath,
   writeSnapshot,
+  stampSnapshotMeta,
   type ListedUpdate,
   type SnapshotStore,
 } from "./append-store";
@@ -570,10 +571,21 @@ export class FireProvider extends ObservableV2<any> {
       this.clearFoldBackoff();
       this.firebaseDataLastUpdatedAt = new Date().getTime();
       Y.applyUpdate(this.doc, bytes, "origin:firebase/update");
+      const appliedSv = meta.snapshotSV ?? stateVectorFromUpdate(bytes);
       this.lastPersistedSV = mergeStateVectors(
         this.lastPersistedSV,
-        meta.snapshotSV ?? stateVectorFromUpdate(bytes),
+        appliedSv,
       );
+      if (defaultBytes) {
+        void stampSnapshotMeta({
+          db: this.db,
+          documentPath: this.documentPath,
+          meta: stored,
+          snapshotSV: appliedSv,
+        }).catch((error) => {
+          this.consoleHandler("stamp snapshot meta error", error);
+        });
+      }
       return true;
     }
     if (meta.content) {
@@ -1038,12 +1050,27 @@ export class FireProvider extends ObservableV2<any> {
     );
     if (result.outcome === "exists") {
       this.hasRemoteContent = true;
-      // Same pack already on Storage: advance SV so appendDelta is a
-      // real WAL, not a second encode of the whole snapshot.
-      if (result.snapshotSV) {
+      // Remote pack already on Storage. Use its SV (field, else read
+      // the blob) so appendDelta is a real WAL, not a second dump.
+      let remoteSv = result.snapshotSV;
+      if (
+        !remoteSv &&
+        this.snapshotStore &&
+        result.contentStoragePath
+      ) {
+        try {
+          const remote = await this.snapshotStore.read({
+            path: result.contentStoragePath,
+          });
+          remoteSv = stateVectorFromUpdate(remote);
+        } catch (error) {
+          this.consoleHandler("exists snapshot SV read error", error);
+        }
+      }
+      if (remoteSv) {
         this.lastPersistedSV = mergeStateVectors(
           this.lastPersistedSV,
-          result.snapshotSV,
+          remoteSv,
         );
       }
       await this.appendDelta(localUpdate);

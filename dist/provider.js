@@ -16,7 +16,7 @@ import { WebRtc } from "./webrtc";
 import { createGraph } from "./graph";
 import { createPersistenceAdapter, decodeEpochMeta, encodeEpochMeta, persistenceMetaKey, } from "./persistence";
 import { EMPTY_YJS_UPDATE_MAX_BYTES, FIRESTORE_CONTENT_MAX_BYTES, contentSizeKind, } from "./firestore-limits";
-import { appendUpdate, DEFAULT_EPOCH_FIELD, DEFAULT_FOLD_BYTES_FRACTION, DEFAULT_FOLD_UPDATE_THRESHOLD, foldUpdates, isAlreadyExistsError, listUpdates, readBytes, readSnapshotMeta, snapshotMetaFromFields, updateIdFromAlreadyExistsError, updatesCollectionPath, writeSnapshot, } from "./append-store";
+import { appendUpdate, DEFAULT_EPOCH_FIELD, DEFAULT_FOLD_BYTES_FRACTION, DEFAULT_FOLD_UPDATE_THRESHOLD, foldUpdates, isAlreadyExistsError, listUpdates, readBytes, readSnapshotMeta, snapshotMetaFromFields, updateIdFromAlreadyExistsError, updatesCollectionPath, writeSnapshot, stampSnapshotMeta, } from "./append-store";
 import { enqueueTabFold } from "./fold-scheduler";
 import { mergeStateVectors, stateVectorCovers, stateVectorFromUpdate } from "./state-vector";
 /** Default budget for `appendUpdate` / first-snapshot Firestore writes. */
@@ -506,7 +506,18 @@ export class FireProvider extends ObservableV2 {
                 this.clearFoldBackoff();
                 this.firebaseDataLastUpdatedAt = new Date().getTime();
                 Y.applyUpdate(this.doc, bytes, "origin:firebase/update");
-                this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, (_d = meta.snapshotSV) !== null && _d !== void 0 ? _d : stateVectorFromUpdate(bytes));
+                const appliedSv = (_d = meta.snapshotSV) !== null && _d !== void 0 ? _d : stateVectorFromUpdate(bytes);
+                this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, appliedSv);
+                if (defaultBytes) {
+                    void stampSnapshotMeta({
+                        db: this.db,
+                        documentPath: this.documentPath,
+                        meta: stored,
+                        snapshotSV: appliedSv,
+                    }).catch((error) => {
+                        this.consoleHandler("stamp snapshot meta error", error);
+                    });
+                }
                 return true;
             }
             if (meta.content) {
@@ -855,10 +866,24 @@ export class FireProvider extends ObservableV2 {
             }));
             if (result.outcome === "exists") {
                 this.hasRemoteContent = true;
-                // Same pack already on Storage: advance SV so appendDelta is a
-                // real WAL, not a second encode of the whole snapshot.
-                if (result.snapshotSV) {
-                    this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, result.snapshotSV);
+                // Remote pack already on Storage. Use its SV (field, else read
+                // the blob) so appendDelta is a real WAL, not a second dump.
+                let remoteSv = result.snapshotSV;
+                if (!remoteSv &&
+                    this.snapshotStore &&
+                    result.contentStoragePath) {
+                    try {
+                        const remote = yield this.snapshotStore.read({
+                            path: result.contentStoragePath,
+                        });
+                        remoteSv = stateVectorFromUpdate(remote);
+                    }
+                    catch (error) {
+                        this.consoleHandler("exists snapshot SV read error", error);
+                    }
+                }
+                if (remoteSv) {
+                    this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, remoteSv);
                 }
                 yield this.appendDelta(localUpdate);
                 return;
