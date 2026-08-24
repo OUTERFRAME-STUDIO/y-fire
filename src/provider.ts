@@ -811,6 +811,22 @@ export class FireProvider extends ObservableV2<any> {
     });
   };
 
+  /**
+   * Adopt snapshot bytes that already live off-Firestore (client Storage
+   * fallback after an empty hydrate). Applies as a remote update so the
+   * pack is not queued as a local first-write, and advances
+   * `lastPersistedSV` so the next save is a small `updates/*` delta.
+   */
+  adoptPersistedSnapshot = (bytes: Uint8Array) => {
+    if (bytes.byteLength <= EMPTY_YJS_UPDATE_MAX_BYTES) return;
+    Y.applyUpdate(this.doc, bytes, "origin:firebase/update");
+    this.hasRemoteContent = true;
+    this.lastPersistedSV = mergeStateVectors(
+      this.lastPersistedSV,
+      stateVectorFromUpdate(bytes),
+    );
+  };
+
   saveToFirestore = async () => {
     if (this.saveInFlight) {
       this.saveQueued = true;

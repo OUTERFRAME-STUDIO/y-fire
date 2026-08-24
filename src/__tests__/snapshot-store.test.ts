@@ -182,6 +182,60 @@ describe("snapshotStore persistence", () => {
     expect(write).not.toHaveBeenCalled();
   });
 
+  it("adoptPersistedSnapshot does not first-write a >1 MiB pack (empty hydrate fallback)", async () => {
+    const source = new Y.Doc();
+    source.getText("t").insert(0, "x".repeat(LARGE_PAYLOAD_CHARS));
+    const bytes = Y.encodeStateAsUpdate(source);
+    expect(bytes.byteLength).toBeGreaterThan(FIRESTORE_CONTENT_MAX_BYTES);
+
+    const { store, write } = createMemorySnapshotStore();
+    const created = await createTestProvider({ snapshotStore: store });
+    provider = created.provider;
+    const onSaveError = vi.fn();
+    provider.onSaveError = onSaveError;
+    await markServerReady(TEST_PATH);
+
+    provider.adoptPersistedSnapshot(bytes);
+    expect(created.ydoc.getText("t").toString().length).toBe(LARGE_PAYLOAD_CHARS);
+
+    await provider.saveToFirestore();
+    expect(write).not.toHaveBeenCalled();
+    expect(addDocCalls.length).toBe(0);
+    expect(
+      onSaveError.mock.calls.map((c) => (c[1] as { reason?: string })?.reason),
+    ).not.toContain("size-abort");
+
+    created.ydoc.getText("t").insert(LARGE_PAYLOAD_CHARS, "!");
+    await provider.saveToFirestore();
+    expect(write).not.toHaveBeenCalled();
+    expect(addDocCalls.length).toBe(1);
+    expect(
+      onSaveError.mock.calls.map((c) => (c[1] as { reason?: string })?.reason),
+    ).not.toContain("size-abort");
+  });
+
+  it("a local applyUpdate of a >1 MiB pack size-aborts without adoptPersistedSnapshot", async () => {
+    const source = new Y.Doc();
+    source.getText("t").insert(0, "x".repeat(LARGE_PAYLOAD_CHARS));
+    const bytes = Y.encodeStateAsUpdate(source);
+
+    const created = await createTestProvider();
+    provider = created.provider;
+    const onSaveError = vi.fn();
+    provider.onSaveError = onSaveError;
+    await markServerReady(TEST_PATH);
+
+    Y.applyUpdate(created.ydoc, bytes);
+    await provider.saveToFirestore();
+
+    expect(
+      onSaveError.mock.calls.map((c) => (c[1] as { reason?: string })?.reason),
+    ).toContain("size-abort");
+    expect(String(onSaveError.mock.calls[0]?.[0])).toContain(
+      "encoded content exceeds Firestore 1 MiB limit",
+    );
+  });
+
   it("writes a ~1.5MB first snapshot via the store without a content field or size-abort", async () => {
     const { store, write } = createMemorySnapshotStore();
     const created = await createTestProvider({ snapshotStore: store });
