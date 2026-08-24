@@ -157,6 +157,16 @@ export function writeSnapshot(opts) {
         let outcome = "written";
         let stored;
         if (opts.snapshotStore) {
+            // Peek first. Writing the store before this check clobbers an
+            // Admin-packed blob when hasRemoteContent is still false (empty
+            // first-write after a missing-path hydrate).
+            let alreadyExists = false;
+            yield runTransaction(opts.db, (tx) => __awaiter(this, void 0, void 0, function* () {
+                const snap = yield tx.get(ref);
+                alreadyExists = hasExistingSnapshot(snap.data());
+            }));
+            if (alreadyExists)
+                return "exists";
             stored = yield opts.snapshotStore.write(opts.content);
         }
         yield runTransaction(opts.db, (tx) => __awaiter(this, void 0, void 0, function* () {
