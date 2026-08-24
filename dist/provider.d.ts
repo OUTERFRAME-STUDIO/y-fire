@@ -8,7 +8,9 @@ import { WebRtc } from "./webrtc";
 import { PersistenceMode } from "./persistence";
 import { type SnapshotStore } from "./append-store";
 export type { SnapshotMeta, SnapshotStore } from "./append-store";
-export type FireSaveReason = "save-failed" | "size-abort" | "size-warn" | "shrink" | "compact-required";
+export type FireSaveReason = "save-failed" | "save-timeout" | "size-abort" | "size-warn" | "shrink" | "compact-required";
+/** Default budget for `appendUpdate` / first-snapshot Firestore writes. */
+export declare const DEFAULT_SAVE_TIMEOUT_MS = 15000;
 export interface FireSaveContext {
     documentPath: string;
     byteLength: number;
@@ -40,6 +42,12 @@ export interface Parameters {
     foldBytesFraction?: number;
     /** Epoch field name; defaults to `contentGeneration`. */
     epochField?: string;
+    /**
+     * Max milliseconds to wait for `appendUpdate` / first-snapshot writes
+     * (default 15s). On timeout the provider reports `save-timeout` and
+     * retries; the underlying Firestore write is not aborted.
+     */
+    saveTimeoutMs?: number;
     /**
      * Optional external snapshot blob store. When set, the provider does not
      * read or write Firestore `content` Bytes; snapshots live in the store and
@@ -91,6 +99,7 @@ export declare class FireProvider extends ObservableV2<any> {
     maxFirestoreDeferral: number;
     maxContentBytes: number;
     scheduledFirstAt?: number;
+    saveTimeoutMs: number;
     saveInFlight: boolean;
     saveStartedAt?: number;
     lastSaveDurationMs: number | null;
@@ -174,6 +183,13 @@ export declare class FireProvider extends ObservableV2<any> {
     }) => void;
     private saveContext;
     private scheduleSaveRetry;
+    /**
+     * Race a Firestore write against {@link saveTimeoutMs}. On timeout the
+     * underlying promise is left running (Firestore cannot cancel `addDoc`);
+     * a dangling `.then` swallows the late result so `lastPersistedSV` /
+     * `lastSeq` stay with the caller that already threw.
+     */
+    private awaitWithSaveTimeout;
     saveToFirestore: () => Promise<void>;
     private abortSize;
     private clearFoldBackoff;
@@ -204,6 +220,6 @@ export declare class FireProvider extends ObservableV2<any> {
     consoleHandler: (message: any, data?: any) => void;
     destroy: () => void;
     kill(keepReadOnly?: boolean): Promise<void>;
-    constructor({ firebaseApp, ydoc, path, docMapper, maxUpdatesThreshold, maxWaitTime, maxWaitFirestoreTime, maxFirestoreDeferral, persistence, maxContentBytes, foldUpdateThreshold, foldBytesFraction, epochField, snapshotStore, }: Parameters);
+    constructor({ firebaseApp, ydoc, path, docMapper, maxUpdatesThreshold, maxWaitTime, maxWaitFirestoreTime, maxFirestoreDeferral, persistence, maxContentBytes, foldUpdateThreshold, foldBytesFraction, epochField, saveTimeoutMs, snapshotStore, }: Parameters);
 }
 //# sourceMappingURL=provider.d.ts.map

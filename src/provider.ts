@@ -51,10 +51,14 @@ import { mergeStateVectors, stateVectorCovers, stateVectorFromUpdate } from "./s
 
 export type FireSaveReason =
   | "save-failed"
+  | "save-timeout"
   | "size-abort"
   | "size-warn"
   | "shrink"
   | "compact-required";
+
+/** Default budget for `appendUpdate` / first-snapshot Firestore writes. */
+export const DEFAULT_SAVE_TIMEOUT_MS = 15_000;
 
 export interface FireSaveContext {
   documentPath: string;
@@ -89,6 +93,12 @@ export interface Parameters {
   foldBytesFraction?: number;
   /** Epoch field name; defaults to `contentGeneration`. */
   epochField?: string;
+  /**
+   * Max milliseconds to wait for `appendUpdate` / first-snapshot writes
+   * (default 15s). On timeout the provider reports `save-timeout` and
+   * retries; the underlying Firestore write is not aborted.
+   */
+  saveTimeoutMs?: number;
   /**
    * Optional external snapshot blob store. When set, the provider does not
    * read or write Firestore `content` Bytes; snapshots live in the store and
@@ -153,6 +163,7 @@ export class FireProvider extends ObservableV2<any> {
   maxFirestoreDeferral: number = 10_000;
   maxContentBytes: number = FIRESTORE_CONTENT_MAX_BYTES;
   scheduledFirstAt?: number;
+  saveTimeoutMs: number = DEFAULT_SAVE_TIMEOUT_MS;
   saveInFlight: boolean = false;
   saveStartedAt?: number;
   lastSaveDurationMs: number | null = null;
@@ -760,6 +771,46 @@ export class FireProvider extends ObservableV2<any> {
     }, this.maxFirestoreWait);
   };
 
+  /**
+   * Race a Firestore write against {@link saveTimeoutMs}. On timeout the
+   * underlying promise is left running (Firestore cannot cancel `addDoc`);
+   * a dangling `.then` swallows the late result so `lastPersistedSV` /
+   * `lastSeq` stay with the caller that already threw.
+   */
+  private awaitWithSaveTimeout<T>(work: Promise<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        void work.then(
+          () => undefined,
+          () => undefined,
+        );
+        reject(
+          Object.assign(new Error("y-fire: Firestore save timed out"), {
+            reason: "save-timeout" as const,
+          }),
+        );
+      }, this.saveTimeoutMs);
+
+      work.then(
+        (value) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (error) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+    });
+  };
+
   saveToFirestore = async () => {
     if (this.saveInFlight) {
       this.saveQueued = true;
@@ -810,10 +861,12 @@ export class FireProvider extends ObservableV2<any> {
           error && typeof error === "object" && "code" in error
             ? String((error as { code: unknown }).code)
             : undefined;
+        const saveReason: FireSaveReason =
+          reason === "save-timeout" ? "save-timeout" : "save-failed";
         if (this.onSaveError) {
           this.onSaveError(
             error,
-            this.saveContext(localUpdate.byteLength, "save-failed", { code }),
+            this.saveContext(localUpdate.byteLength, saveReason, { code }),
           );
         }
         this.scheduleSaveRetry();
@@ -938,13 +991,15 @@ export class FireProvider extends ObservableV2<any> {
         this.onSaveWarning(this.saveContext(localUpdate.byteLength, "size-warn"));
       }
     }
-    const outcome = await writeSnapshot({
-      db: this.db,
-      documentPath: this.documentPath,
-      content: localUpdate,
-      documentMapper: this.documentMapper,
-      snapshotStore: this.snapshotStore,
-    });
+    const outcome = await this.awaitWithSaveTimeout(
+      writeSnapshot({
+        db: this.db,
+        documentPath: this.documentPath,
+        content: localUpdate,
+        documentMapper: this.documentMapper,
+        snapshotStore: this.snapshotStore,
+      }),
+    );
     if (outcome === "exists") {
       this.hasRemoteContent = true;
       await this.appendDelta(localUpdate);
@@ -974,11 +1029,13 @@ export class FireProvider extends ObservableV2<any> {
     const seq = this.lastSeq + 1;
     let result: { id?: string } | undefined;
     try {
-      result = await appendUpdate(this.db, this.documentPath, {
-        update: delta,
-        seq,
-        clientId: this.uid,
-      });
+      result = await this.awaitWithSaveTimeout(
+        appendUpdate(this.db, this.documentPath, {
+          update: delta,
+          seq,
+          clientId: this.uid,
+        }),
+      );
     } catch (error) {
       // Create already committed / lost ack.
       if (!isAlreadyExistsError(error)) throw error;
@@ -1286,6 +1343,7 @@ export class FireProvider extends ObservableV2<any> {
     foldUpdateThreshold,
     foldBytesFraction,
     epochField,
+    saveTimeoutMs,
     snapshotStore,
   }: Parameters) {
     super();
@@ -1304,6 +1362,7 @@ export class FireProvider extends ObservableV2<any> {
     if (foldUpdateThreshold) this.foldUpdateThreshold = foldUpdateThreshold;
     if (foldBytesFraction) this.foldBytesFraction = foldBytesFraction;
     if (epochField) this.epochField = epochField;
+    if (saveTimeoutMs !== undefined) this.saveTimeoutMs = saveTimeoutMs;
     if (snapshotStore) this.snapshotStore = snapshotStore;
     this.persistenceMode = persistence ?? "indexeddb";
     this.persistenceAdapter = createPersistenceAdapter(this.persistenceMode);
