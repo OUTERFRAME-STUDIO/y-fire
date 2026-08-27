@@ -11,6 +11,7 @@ export type { SnapshotMeta, SnapshotStore } from "./append-store";
 export type FireSaveReason = "save-failed" | "save-timeout" | "size-abort" | "size-warn" | "shrink" | "compact-required";
 /** Default budget for `appendUpdate` / first-snapshot Firestore writes. */
 export declare const DEFAULT_SAVE_TIMEOUT_MS = 15000;
+export type FireSavePhase = "local-flush" | "encode" | "write";
 export interface FireSaveContext {
     documentPath: string;
     byteLength: number;
@@ -102,6 +103,10 @@ export declare class FireProvider extends ObservableV2<any> {
     saveTimeoutMs: number;
     saveInFlight: boolean;
     saveStartedAt?: number;
+    savePhase?: FireSavePhase;
+    saveWriteStartedAt?: number;
+    lastLocalFlushMs: number | null;
+    lastEncodeMs: number | null;
     lastSaveDurationMs: number | null;
     private saveQueued;
     firebaseDataLastUpdatedAt: number;

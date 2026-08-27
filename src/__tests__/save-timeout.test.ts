@@ -5,6 +5,7 @@ import {
   setAddDocImpl,
   setRunTransactionBefore,
 } from "./_mocks/firestore";
+import { idbStore, set } from "./_mocks/idb";
 import {
   createTestProvider,
   emitServerUpdate,
@@ -175,5 +176,84 @@ describe("saveTimeoutMs", () => {
 
     expect(saveReasons(onSaveError)).toContain("save-timeout");
     expect(provider.saveInFlight).toBe(false);
+  });
+});
+
+describe("save phase clocks", () => {
+  beforeEach(() => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.useFakeTimers();
+    setAddDocImpl(async () => {});
+    setRunTransactionBefore(async () => {});
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.mocked(console.log).mockRestore();
+    set.mockImplementation(async (key: string, value: Uint8Array) => {
+      idbStore.set(key, value);
+    });
+  });
+
+  it("stamps write phase and encode/flush durations on a hung append", async () => {
+    const { provider, ydoc } = await createAppendReadyProvider();
+    setAddDocImpl(() => new Promise<void>(() => {}));
+
+    ydoc.getText("local").insert(0, "a");
+    const save = provider.saveToFirestore();
+    await waitUntil(() => addDocCalls.length === 1, "hung appendUpdate");
+
+    expect(provider.savePhase).toBe("write");
+    expect(typeof provider.saveWriteStartedAt).toBe("number");
+    expect(typeof provider.lastLocalFlushMs).toBe("number");
+    expect(typeof provider.lastEncodeMs).toBe("number");
+
+    await vi.advanceTimersByTimeAsync(SAVE_TIMEOUT_MS);
+    await save;
+    await flushMicrotasks();
+
+    expect(provider.savePhase).toBeUndefined();
+    expect(provider.saveWriteStartedAt).toBeUndefined();
+    expect(typeof provider.lastLocalFlushMs).toBe("number");
+    expect(typeof provider.lastEncodeMs).toBe("number");
+  });
+
+  it("exposes local-flush while IndexedDB persist is in flight", async () => {
+    const { provider, ydoc } = await createAppendReadyProvider();
+    const pending: Array<() => void> = [];
+    set.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          pending.push(resolve);
+        }),
+    );
+
+    ydoc.getText("local").insert(0, "flush");
+    const save = provider.saveToFirestore();
+    await flushMicrotasks();
+
+    expect(provider.savePhase).toBe("local-flush");
+    expect(provider.saveWriteStartedAt).toBeUndefined();
+    expect(addDocCalls.length).toBe(0);
+
+    set.mockImplementation(async (key: string, value: Uint8Array) => {
+      idbStore.set(key, value);
+    });
+    for (const release of pending) release();
+    await waitUntil(() => addDocCalls.length === 1, "append after flush");
+    expect(provider.savePhase).toBe("write");
+    await save;
+  });
+
+  it("clears phase clocks after a successful save and keeps last durations", async () => {
+    const { provider, ydoc } = await createAppendReadyProvider();
+    ydoc.getText("local").insert(0, "fast");
+    await provider.saveToFirestore();
+    await flushMicrotasks();
+
+    expect(provider.savePhase).toBeUndefined();
+    expect(provider.saveWriteStartedAt).toBeUndefined();
+    expect(provider.lastLocalFlushMs).not.toBeNull();
+    expect(provider.lastEncodeMs).not.toBeNull();
   });
 });
