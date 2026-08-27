@@ -61,6 +61,8 @@ export type FireSaveReason =
 /** Default budget for `appendUpdate` / first-snapshot Firestore writes. */
 export const DEFAULT_SAVE_TIMEOUT_MS = 15_000;
 
+export type FireSavePhase = "local-flush" | "encode" | "write";
+
 export interface FireSaveContext {
   documentPath: string;
   byteLength: number;
@@ -167,6 +169,10 @@ export class FireProvider extends ObservableV2<any> {
   saveTimeoutMs: number = DEFAULT_SAVE_TIMEOUT_MS;
   saveInFlight: boolean = false;
   saveStartedAt?: number;
+  savePhase?: FireSavePhase;
+  saveWriteStartedAt?: number;
+  lastLocalFlushMs: number | null = null;
+  lastEncodeMs: number | null = null;
   lastSaveDurationMs: number | null = null;
   private saveQueued: boolean = false;
 
@@ -812,6 +818,8 @@ export class FireProvider extends ObservableV2<any> {
    * `lastSeq` stay with the caller that already threw.
    */
   private awaitWithSaveTimeout<T>(work: Promise<T>): Promise<T> {
+    this.savePhase = "write";
+    this.saveWriteStartedAt = Date.now();
     return new Promise<T>((resolve, reject) => {
       let settled = false;
       const timer = setTimeout(() => {
@@ -875,12 +883,18 @@ export class FireProvider extends ObservableV2<any> {
     let flushQueuedAfterSuccess = false;
     let foldAfterSave: Uint8Array | undefined;
     try {
+      this.savePhase = "local-flush";
+      const flushStartedAt = Date.now();
       await this.flushSaveToLocal();
+      this.lastLocalFlushMs = Date.now() - flushStartedAt;
       if (!this.serverReady || this.epochReplaced) {
         this.saveQueued = false;
         return;
       }
+      this.savePhase = "encode";
+      const encodeStartedAt = Date.now();
       const localUpdate = Y.encodeStateAsUpdate(this.doc);
+      this.lastEncodeMs = Date.now() - encodeStartedAt;
       try {
         if (!this.hasRemoteContent) {
           await this.writeFirstSnapshot(localUpdate);
@@ -924,6 +938,8 @@ export class FireProvider extends ObservableV2<any> {
     } finally {
       this.saveInFlight = false;
       this.saveStartedAt = undefined;
+      this.savePhase = undefined;
+      this.saveWriteStartedAt = undefined;
     }
     if (flushQueuedAfterSuccess) {
       this.sendToFirestoreQueue();

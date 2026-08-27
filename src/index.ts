@@ -3,6 +3,7 @@ export type {
   Parameters as FireProviderConfig,
   FireSaveContext,
   FireSaveReason,
+  FireSavePhase,
   EpochReplaceEvent,
   SnapshotMeta,
   SnapshotStore,

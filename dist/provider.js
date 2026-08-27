@@ -59,6 +59,8 @@ export class FireProvider extends ObservableV2 {
      * `lastSeq` stay with the caller that already threw.
      */
     awaitWithSaveTimeout(work) {
+        this.savePhase = "write";
+        this.saveWriteStartedAt = Date.now();
         return new Promise((resolve, reject) => {
             let settled = false;
             const timer = setTimeout(() => {
@@ -167,6 +169,8 @@ export class FireProvider extends ObservableV2 {
         this.maxContentBytes = FIRESTORE_CONTENT_MAX_BYTES;
         this.saveTimeoutMs = DEFAULT_SAVE_TIMEOUT_MS;
         this.saveInFlight = false;
+        this.lastLocalFlushMs = null;
+        this.lastEncodeMs = null;
         this.lastSaveDurationMs = null;
         this.saveQueued = false;
         this.firebaseDataLastUpdatedAt = new Date().getTime();
@@ -717,12 +721,18 @@ export class FireProvider extends ObservableV2 {
             let flushQueuedAfterSuccess = false;
             let foldAfterSave;
             try {
+                this.savePhase = "local-flush";
+                const flushStartedAt = Date.now();
                 yield this.flushSaveToLocal();
+                this.lastLocalFlushMs = Date.now() - flushStartedAt;
                 if (!this.serverReady || this.epochReplaced) {
                     this.saveQueued = false;
                     return;
                 }
+                this.savePhase = "encode";
+                const encodeStartedAt = Date.now();
                 const localUpdate = Y.encodeStateAsUpdate(this.doc);
+                this.lastEncodeMs = Date.now() - encodeStartedAt;
                 try {
                     if (!this.hasRemoteContent) {
                         yield this.writeFirstSnapshot(localUpdate);
@@ -765,6 +775,8 @@ export class FireProvider extends ObservableV2 {
             finally {
                 this.saveInFlight = false;
                 this.saveStartedAt = undefined;
+                this.savePhase = undefined;
+                this.saveWriteStartedAt = undefined;
             }
             if (flushQueuedAfterSuccess) {
                 this.sendToFirestoreQueue();
