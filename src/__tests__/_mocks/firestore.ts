@@ -65,6 +65,13 @@ export function setAddDocError(error: unknown | null) {
   addDocShouldFail = error;
 }
 
+/** Independent of {@link getDoc}. Tests reject the epoch-verify read alone. */
+export let getDocFromServerShouldFail: unknown = null;
+
+export function setGetDocFromServerError(error: unknown | null) {
+  getDocFromServerShouldFail = error;
+}
+
 export let runTransactionBefore: () => Promise<void> = async () => {};
 
 export function setRunTransactionBefore(impl: () => Promise<void>) {
@@ -88,6 +95,7 @@ export function resetFirestoreMock() {
   addDocImpl = async () => {};
   transactionShouldFail = null;
   addDocShouldFail = null;
+  getDocFromServerShouldFail = null;
   runTransactionBefore = async () => {};
   firestoreDocs.clear();
   firestoreCollections.clear();
@@ -101,6 +109,7 @@ export function resetFirestoreMock() {
   addDoc.mockClear();
   getDocs.mockClear();
   getDoc.mockClear();
+  getDocFromServer.mockClear();
   deleteDoc.mockClear();
   query.mockClear();
   orderBy.mockClear();
@@ -327,6 +336,19 @@ export const addDoc = vi.fn(async (ref: MockRef, data: unknown) => {
 });
 
 export const getDoc = vi.fn(async (ref: MockRef) => {
+  const data = firestoreDocs.get(ref.path);
+  return {
+    exists: () => data !== undefined,
+    data: () => data,
+    id: ref.path.split("/").pop(),
+    metadata: { fromCache: false, hasPendingWrites: false },
+  };
+});
+
+export const getDocFromServer = vi.fn(async (ref: MockRef) => {
+  if (getDocFromServerShouldFail) {
+    throw getDocFromServerShouldFail;
+  }
   const data = firestoreDocs.get(ref.path);
   return {
     exists: () => data !== undefined,
