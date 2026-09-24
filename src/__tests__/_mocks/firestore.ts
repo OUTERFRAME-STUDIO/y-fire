@@ -100,6 +100,7 @@ export function resetFirestoreMock() {
   setDoc.mockClear();
   addDoc.mockClear();
   getDocs.mockClear();
+  getDoc.mockClear();
   deleteDoc.mockClear();
   query.mockClear();
   orderBy.mockClear();
@@ -323,6 +324,16 @@ export const addDoc = vi.fn(async (ref: MockRef, data: unknown) => {
   col.set(id, (data ?? {}) as Record<string, unknown>);
   notifyCollection(ref.path);
   return { id, path: `${ref.path}/${id}` };
+});
+
+export const getDoc = vi.fn(async (ref: MockRef) => {
+  const data = firestoreDocs.get(ref.path);
+  return {
+    exists: () => data !== undefined,
+    data: () => data,
+    id: ref.path.split("/").pop(),
+    metadata: { fromCache: false, hasPendingWrites: false },
+  };
 });
 
 export const getDocs = vi.fn(async (ref: MockRef) => {

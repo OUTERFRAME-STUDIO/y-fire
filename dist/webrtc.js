@@ -13,8 +13,23 @@ import { getFirestore, doc, onSnapshot, setDoc, deleteDoc, } from "@firebase/fir
 import { ObservableV2 } from "lib0/observable";
 import SimplePeer from "simple-peer-light";
 import { Uint8ArrayToBase64, base64ToUint8Array, decryptData, encryptData, generateKey, killZombie, } from "./utils";
+/**
+ * Numeric epochs must match. Payloads with no epoch are legacy peers and
+ * still apply. A numeric epoch with no local epoch yet does not match.
+ */
+export function shouldApplyPeerUpdate(remoteEpoch, localEpoch) {
+    if (typeof remoteEpoch !== "number")
+        return true;
+    return remoteEpoch === localEpoch;
+}
+export function applyPeerYjsUpdate(doc, update, origin, remoteEpoch, localEpoch) {
+    if (!shouldApplyPeerUpdate(remoteEpoch, localEpoch))
+        return false;
+    Y.applyUpdate(doc, update, origin);
+    return true;
+}
 export class WebRtc extends ObservableV2 {
-    constructor({ firebaseApp, ydoc, awareness, instanceConnection, documentPath, uid, peerUid, isCaller = false, }) {
+    constructor({ firebaseApp, ydoc, awareness, instanceConnection, documentPath, uid, peerUid, isCaller = false, localEpoch, }) {
         super();
         this.ice = {
             iceServers: [
@@ -22,6 +37,7 @@ export class WebRtc extends ObservableV2 {
                 { urls: "stun:stun1.l.google.com:19302" },
             ],
         };
+        this.localEpoch = () => undefined;
         this.connection = "connecting";
         this.idleThreshold = 20000;
         this.initPeer = () => {
@@ -167,7 +183,7 @@ export class WebRtc extends ObservableV2 {
             this.instanceConnection.emit("closed", [true]);
             this.destroy();
         };
-        this.sendData = ({ message, data, }) => __awaiter(this, void 0, void 0, function* () {
+        this.sendData = ({ message, data, epoch, }) => __awaiter(this, void 0, void 0, function* () {
             const msg = {};
             msg.uid = this.uid;
             if (message)
@@ -175,6 +191,8 @@ export class WebRtc extends ObservableV2 {
             if (data) {
                 msg.data = yield Uint8ArrayToBase64(data);
             }
+            if (typeof epoch === "number")
+                msg.epoch = epoch;
             const encrypted = yield encryptData(msg, this.peerKey);
             // Re-check after encrypt await — channel may have closed during the race
             // (Safari InvalidStateError / Chrome readyState not open on peer.send).
@@ -200,7 +218,7 @@ export class WebRtc extends ObservableV2 {
                     }
                     else if (!decrypted.message && decrypted.data) {
                         // this.consoleHandler("decrypted data", decrypted);
-                        Y.applyUpdate(this.doc, decrypted.data, decrypted.uid);
+                        applyPeerYjsUpdate(this.doc, decrypted.data, decrypted.uid, decrypted.epoch, this.localEpoch());
                     }
                 }
             }
@@ -220,6 +238,8 @@ export class WebRtc extends ObservableV2 {
         this.documentPath = documentPath;
         this.uid = uid;
         this.peerUid = peerUid;
+        if (localEpoch)
+            this.localEpoch = localEpoch;
         this.db = getFirestore(firebaseApp);
         this.isCaller = isCaller;
         /**

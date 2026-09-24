@@ -32,12 +32,14 @@ import {
   DEFAULT_EPOCH_FIELD,
   DEFAULT_FOLD_BYTES_FRACTION,
   DEFAULT_FOLD_UPDATE_THRESHOLD,
+  EpochMismatchError,
   foldUpdates,
   isAlreadyExistsError,
   listUpdates,
   readBytes,
   readSnapshotMeta,
   snapshotMetaFromFields,
+  updateEpochMatches,
   updateIdFromAlreadyExistsError,
   updatesCollectionPath,
   writeSnapshot,
@@ -202,6 +204,8 @@ export class FireProvider extends ObservableV2<any> {
   private lastSnapshotFromCache: boolean = true;
   private hasRemoteContent: boolean = false;
   private hydratedEpoch?: number;
+  /** Latest epoch field value seen by the shard listener, including a replace. */
+  private latestObservedEpoch?: number;
   private epochReplaced: boolean = false;
   private appliedUpdateIds: Set<string> = new Set();
   private lastSeq: number = 0;
@@ -221,6 +225,9 @@ export class FireProvider extends ObservableV2<any> {
   private foldAbortReported: boolean = false;
   private updatesAccessDenied: boolean = false;
   private updatesDeniedWarned: boolean = false;
+  private lastUpdatesSnapshot?: {
+    forEach?: (fn: (d: { id: string; data?: () => unknown }) => void) => void;
+  };
   private snapshotStore?: SnapshotStore;
   private snapshotHydrateGen: number = 0;
 
@@ -259,7 +266,7 @@ export class FireProvider extends ObservableV2<any> {
   };
 
   syncLocal = async () => {
-    if (!this.serverReady) {
+    if (!this.serverReady || this.hydratedEpoch === undefined) {
       this.pendingSyncLocal = true;
       return;
     }
@@ -407,6 +414,77 @@ export class FireProvider extends ObservableV2<any> {
     );
   };
 
+  private enterEpochReplace(to: number) {
+    if (this.epochReplaced) return;
+    const from = this.hydratedEpoch ?? 0;
+    this.epochReplaced = true;
+    void this.deleteLocal();
+    if (this.onEpochReplace) this.onEpochReplace({ from, to });
+  }
+
+  /**
+   * Refuse Firestore content/update writes until a server snapshot has
+   * pinned an epoch, and stop once this replica has been replaced.
+   * A newer epoch observed by the doc listener takes the replace path
+   * before any write.
+   */
+  private assertCanWriteFirestore(): void {
+    if (this.epochReplaced) throw new FirestoreWriteStopped();
+    if (this.hydratedEpoch === undefined) throw new FirestoreWriteDeferred();
+    if (
+      this.latestObservedEpoch !== undefined &&
+      this.latestObservedEpoch > this.hydratedEpoch
+    ) {
+      this.enterEpochReplace(this.latestObservedEpoch);
+      throw new FirestoreWriteStopped();
+    }
+  }
+
+  private replayObservedUpdates = () => {
+    if (this.lastUpdatesSnapshot) {
+      this.consumeUpdatesSnapshot(this.lastUpdatesSnapshot);
+    }
+  };
+
+  private consumeUpdatesSnapshot = (snap: {
+    forEach?: (fn: (d: { id: string; data?: () => unknown }) => void) => void;
+  }) => {
+    this.updateDocCount = 0;
+    this.updateTotalBytes = 0;
+    const listed: ListedUpdate[] = [];
+    const currentEpoch = this.hydratedEpoch;
+    if (
+      !this.epochReplaced &&
+      currentEpoch !== undefined &&
+      typeof snap.forEach === "function"
+    ) {
+      snap.forEach((d: { id: string; data?: () => unknown }) => {
+        const data = (
+          typeof d.data === "function" ? d.data() : undefined
+        ) as Record<string, unknown> | undefined;
+        const bytes = readBytes(data?.update);
+        if (!bytes) return;
+        if (!updateEpochMatches(data?.epoch, currentEpoch)) return;
+        listed.push({
+          id: d.id,
+          update: bytes,
+          seq: typeof data?.seq === "number" ? data.seq : 0,
+          clientId:
+            typeof data?.clientId === "string" ? data.clientId : undefined,
+        });
+        this.updateDocCount++;
+        this.updateTotalBytes += bytes.byteLength;
+        if (this.appliedUpdateIds.has(d.id)) return;
+        this.appliedUpdateIds.add(d.id);
+        if (typeof data?.seq === "number" && data.seq > this.lastSeq) {
+          this.lastSeq = data.seq;
+        }
+        this.applyRemoteUpdateBytes(bytes);
+      });
+    }
+    this.listedUpdates = listed;
+  };
+
   trackData = () => {
     // Whenever there are changes to the firebase document
     // pull the changes and merge them to the current
@@ -442,36 +520,8 @@ export class FireProvider extends ObservableV2<any> {
         this.snapshotRetryAttempt = 0;
         const fromCache = snap.metadata?.fromCache === true;
         this.updatesAccessDenied = false;
-        this.updateDocCount = 0;
-        this.updateTotalBytes = 0;
-        const listed: ListedUpdate[] = [];
-        if (!this.epochReplaced && typeof snap.forEach === "function") {
-          snap.forEach(
-            (d: { id: string; data?: () => unknown }) => {
-              const data = (
-                typeof d.data === "function" ? d.data() : undefined
-              ) as Record<string, unknown> | undefined;
-              const bytes = readBytes(data?.update);
-              if (!bytes) return;
-              listed.push({
-                id: d.id,
-                update: bytes,
-                seq: typeof data?.seq === "number" ? data.seq : 0,
-                clientId:
-                  typeof data?.clientId === "string" ? data.clientId : undefined,
-              });
-              this.updateDocCount++;
-              this.updateTotalBytes += bytes.byteLength;
-              if (this.appliedUpdateIds.has(d.id)) return;
-              this.appliedUpdateIds.add(d.id);
-              if (typeof data?.seq === "number" && data.seq > this.lastSeq) {
-                this.lastSeq = data.seq;
-              }
-              this.applyRemoteUpdateBytes(bytes);
-            },
-          );
-        }
-        this.listedUpdates = listed;
+        this.lastUpdatesSnapshot = snap;
+        this.consumeUpdatesSnapshot(snap);
         if (!fromCache) {
           this.updatesServerSnapshot = true;
           this.maybeBecomeServerReady();
@@ -512,23 +562,18 @@ export class FireProvider extends ObservableV2<any> {
     if (snap.exists()) {
       const data = snap.data() as Record<string, unknown> | undefined;
       const meta = readSnapshotMeta(data, this.epochField);
+      this.latestObservedEpoch = meta.epoch;
       if (
         this.hydratedEpoch !== undefined &&
         meta.epoch > this.hydratedEpoch
       ) {
-        if (!this.epochReplaced) {
-          const from = this.hydratedEpoch;
-          this.epochReplaced = true;
-          void this.deleteLocal();
-          if (this.onEpochReplace) {
-            this.onEpochReplace({ from, to: meta.epoch });
-          }
-        }
+        this.enterEpochReplace(meta.epoch);
       } else {
         const applied = await this.applyRemoteSnapshot(meta, hydrateGen);
         if (!applied) return;
         this.hydrateRetryAttempt = 0;
         this.hydratedEpoch = meta.epoch;
+        this.replayObservedUpdates();
       }
       if (hydrateGen !== this.snapshotHydrateGen) return;
       if (!this.ready) {
@@ -537,6 +582,16 @@ export class FireProvider extends ObservableV2<any> {
           this.ready = true;
         }
       }
+    } else if (
+      !fromCache &&
+      !this.epochReplaced &&
+      this.hydratedEpoch === undefined
+    ) {
+      // Server-confirmed absence. Cache-only "missing" must not pin epoch 0
+      // or a later server snapshot of a real epoch false-triggers replace.
+      this.latestObservedEpoch = 0;
+      this.hydratedEpoch = 0;
+      this.replayObservedUpdates();
     }
     if (hydrateGen !== this.snapshotHydrateGen) return;
     if (!fromCache) {
@@ -774,6 +829,7 @@ export class FireProvider extends ObservableV2<any> {
           uid: this.uid,
           peerUid,
           isCaller,
+          localEpoch: () => this.hydratedEpoch,
         });
       });
     }
@@ -789,12 +845,18 @@ export class FireProvider extends ObservableV2<any> {
     message: unknown;
     data: Uint8Array | null;
   }) => {
+    const epoch =
+      !message && data && typeof this.hydratedEpoch === "number"
+        ? this.hydratedEpoch
+        : undefined;
+    const payload =
+      epoch === undefined ? { message, data } : { message, data, epoch };
     if (this.peersRTC) {
       if (this.peersRTC.receivers) {
         Object.keys(this.peersRTC.receivers).forEach((receiver) => {
           if (receiver !== from) {
             const rtc = this.peersRTC.receivers[receiver];
-            rtc.sendData({ message, data });
+            rtc.sendData(payload);
           }
         });
       }
@@ -802,7 +864,7 @@ export class FireProvider extends ObservableV2<any> {
         Object.keys(this.peersRTC.senders).forEach((sender) => {
           if (sender !== from) {
             const rtc = this.peersRTC.senders[sender];
-            rtc.sendData({ message, data });
+            rtc.sendData(payload);
           }
         });
       }
@@ -913,11 +975,17 @@ export class FireProvider extends ObservableV2<any> {
         this.saveQueued = false;
         return;
       }
+      if (this.hydratedEpoch === undefined) {
+        this.saveQueued = true;
+        this.scheduleSaveRetry();
+        return;
+      }
       this.savePhase = "encode";
       const encodeStartedAt = Date.now();
       const localUpdate = Y.encodeStateAsUpdate(this.doc);
       this.lastEncodeMs = Date.now() - encodeStartedAt;
       try {
+        this.assertCanWriteFirestore();
         if (!this.hasRemoteContent) {
           await this.writeFirstSnapshot(localUpdate);
         } else {
@@ -934,6 +1002,20 @@ export class FireProvider extends ObservableV2<any> {
         this.saveQueued = false;
         if (foldAfterSave) this.scheduleFold(foldAfterSave);
       } catch (error) {
+        if (error instanceof FirestoreWriteDeferred) {
+          this.saveQueued = true;
+          this.scheduleSaveRetry();
+          return;
+        }
+        if (error instanceof EpochMismatchError) {
+          this.enterEpochReplace(error.actual);
+          this.saveQueued = false;
+          return;
+        }
+        if (error instanceof FirestoreWriteStopped || this.epochReplaced) {
+          this.saveQueued = false;
+          return;
+        }
         this.consoleHandler("saveToFirestore: CAUGHT error", error);
         const reason =
           error && typeof error === "object" && "reason" in error
@@ -1046,7 +1128,8 @@ export class FireProvider extends ObservableV2<any> {
       ? []
       : this.listedUpdates.length > 0
         ? this.listedUpdates.slice()
-        : await listUpdates(this.db, this.documentPath);
+        : await listUpdates(this.db, this.documentPath, this.epochField);
+    this.assertCanWriteFirestore();
     const fold = await foldUpdates({
       db: this.db,
       documentPath: this.documentPath,
@@ -1056,6 +1139,8 @@ export class FireProvider extends ObservableV2<any> {
       maxContentBytes: this.maxContentBytes,
       force: true,
       snapshotStore: this.snapshotStore,
+      expectedEpoch: this.hydratedEpoch as number,
+      epochField: this.epochField,
     });
     if (fold.status === "abort") {
       this.beginFoldBackoff();
@@ -1079,6 +1164,7 @@ export class FireProvider extends ObservableV2<any> {
         this.onSaveWarning(this.saveContext(localUpdate.byteLength, "size-warn"));
       }
     }
+    this.assertCanWriteFirestore();
     const result = await this.awaitWithSaveTimeout(
       writeSnapshot({
         db: this.db,
@@ -1086,6 +1172,8 @@ export class FireProvider extends ObservableV2<any> {
         content: localUpdate,
         documentMapper: this.documentMapper,
         snapshotStore: this.snapshotStore,
+        expectedEpoch: this.hydratedEpoch as number,
+        epochField: this.epochField,
       }),
     );
     if (result.outcome === "exists") {
@@ -1146,19 +1234,35 @@ export class FireProvider extends ObservableV2<any> {
     const seq = this.lastSeq + 1;
     let result: { id?: string } | undefined;
     try {
+      this.assertCanWriteFirestore();
       result = await this.awaitWithSaveTimeout(
         appendUpdate(this.db, this.documentPath, {
           update: delta,
           seq,
+          epoch: this.hydratedEpoch as number,
           clientId: this.uid,
         }),
       );
     } catch (error) {
       // Create already committed / lost ack.
-      if (!isAlreadyExistsError(error)) throw error;
-      const id = updateIdFromAlreadyExistsError(error);
-      result = id ? { id } : undefined;
+      if (isAlreadyExistsError(error)) {
+        const id = updateIdFromAlreadyExistsError(error);
+        result = id ? { id } : undefined;
+      } else if (isAppendEpochFenceError(error)) {
+        const to =
+          error instanceof EpochMismatchError
+            ? error.actual
+            : this.latestObservedEpoch !== undefined &&
+                this.latestObservedEpoch !== this.hydratedEpoch
+              ? this.latestObservedEpoch
+              : (this.hydratedEpoch ?? 0);
+        this.enterEpochReplace(to);
+        return;
+      } else {
+        throw error;
+      }
     }
+    if (this.epochReplaced) return;
     this.lastSeq = seq;
     if (result?.id) this.appliedUpdateIds.add(result.id);
     this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, svAtEncode);
@@ -1188,7 +1292,7 @@ export class FireProvider extends ObservableV2<any> {
   };
 
   private maybeFold = async (localUpdate: Uint8Array) => {
-    if (this.epochReplaced) return;
+    if (this.epochReplaced || this.hydratedEpoch === undefined) return;
     if (this.shouldSkipFold()) return;
     const bytesThreshold = Math.floor(
       this.maxContentBytes * this.foldBytesFraction,
@@ -1201,6 +1305,7 @@ export class FireProvider extends ObservableV2<any> {
     }
     try {
       const listed = this.listedUpdates.slice();
+      this.assertCanWriteFirestore();
       const fold = await foldUpdates({
         db: this.db,
         documentPath: this.documentPath,
@@ -1209,6 +1314,8 @@ export class FireProvider extends ObservableV2<any> {
         documentMapper: this.documentMapper,
         maxContentBytes: this.maxContentBytes,
         snapshotStore: this.snapshotStore,
+        expectedEpoch: this.hydratedEpoch as number,
+        epochField: this.epochField,
       });
       if (fold.status === "abort") {
         this.beginFoldBackoff();
@@ -1218,6 +1325,16 @@ export class FireProvider extends ObservableV2<any> {
       if (fold.status !== "ok") return;
       this.applyFoldSuccess(fold, listed);
     } catch (error) {
+      if (error instanceof EpochMismatchError) {
+        this.enterEpochReplace(error.actual);
+        return;
+      }
+      if (
+        error instanceof FirestoreWriteStopped ||
+        error instanceof FirestoreWriteDeferred
+      ) {
+        return;
+      }
       this.consoleHandler("foldUpdates error", error);
     }
   };
@@ -1488,4 +1605,27 @@ export class FireProvider extends ObservableV2<any> {
     // Initialize the provider
     const init = this.init();
   }
+}
+
+/** Save stays queued until a server snapshot pins hydratedEpoch. */
+class FirestoreWriteDeferred extends Error {
+  constructor() {
+    super("y-fire: Firestore write deferred until epoch hydrate");
+    this.name = "FirestoreWriteDeferred";
+  }
+}
+
+/** Replica is done writing (epoch replace already entered or in progress). */
+class FirestoreWriteStopped extends Error {
+  constructor() {
+    super("y-fire: Firestore write stopped after epoch replace");
+    this.name = "FirestoreWriteStopped";
+  }
+}
+
+function isAppendEpochFenceError(error: unknown): boolean {
+  if (error instanceof EpochMismatchError) return true;
+  if (!error || typeof error !== "object" || !("code" in error)) return false;
+  const code = String((error as { code: unknown }).code);
+  return code === "permission-denied" || code === "firestore/permission-denied";
 }
