@@ -117,6 +117,7 @@ export declare class FireProvider extends ObservableV2<any> {
     private persistenceAdapter;
     private persistenceMode;
     private snapshotRetryAttempt;
+    private hydrateRetryAttempt;
     private meshRetryAttempt;
     private snapshotRetryTimeout?;
     private meshRetryTimeout?;
@@ -167,6 +168,7 @@ export declare class FireProvider extends ObservableV2<any> {
     deleteLocal: () => Promise<void>;
     initiateHandler: () => void;
     private scheduleSnapshotRetry;
+    private scheduleHydrateRetry;
     private scheduleMeshRetry;
     private maybeBecomeServerReady;
     private applyRemoteUpdateBytes;

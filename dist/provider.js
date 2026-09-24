@@ -176,6 +176,11 @@ export class FireProvider extends ObservableV2 {
         this.firebaseDataLastUpdatedAt = new Date().getTime();
         this.instanceConnection = new ObservableV2();
         this.snapshotRetryAttempt = 0;
+        // Separate from `snapshotRetryAttempt`: every retry re-subscribes and the
+        // listeners' (often cached) first snapshot resets that counter before the
+        // snapshotStore read can fail again, which pinned a persistent Storage
+        // error (e.g. storage/unauthorized) at the base delay forever.
+        this.hydrateRetryAttempt = 0;
         this.meshRetryAttempt = 0;
         this.dataListenerPaused = false;
         this.pendingSyncLocal = false;
@@ -302,6 +307,16 @@ export class FireProvider extends ObservableV2 {
             const delay = Math.min(SNAPSHOT_BACKOFF_BASE_MS * Math.pow(2, this.snapshotRetryAttempt), SNAPSHOT_BACKOFF_MAX_MS);
             this.snapshotRetryAttempt++;
             this.consoleHandler("Scheduling trackData retry", `attempt ${this.snapshotRetryAttempt}, delay ${delay}ms`);
+            if (this.snapshotRetryTimeout)
+                clearTimeout(this.snapshotRetryTimeout);
+            this.snapshotRetryTimeout = setTimeout(() => {
+                this.trackData();
+            }, delay);
+        };
+        this.scheduleHydrateRetry = () => {
+            const delay = Math.min(SNAPSHOT_BACKOFF_BASE_MS * Math.pow(2, this.hydrateRetryAttempt), SNAPSHOT_BACKOFF_MAX_MS);
+            this.hydrateRetryAttempt++;
+            this.consoleHandler("Scheduling snapshot hydrate retry", `attempt ${this.hydrateRetryAttempt}, delay ${delay}ms`);
             if (this.snapshotRetryTimeout)
                 clearTimeout(this.snapshotRetryTimeout);
             this.snapshotRetryTimeout = setTimeout(() => {
@@ -439,6 +454,7 @@ export class FireProvider extends ObservableV2 {
                     const applied = yield this.applyRemoteSnapshot(meta, hydrateGen);
                     if (!applied)
                         return;
+                    this.hydrateRetryAttempt = 0;
                     this.hydratedEpoch = meta.epoch;
                 }
                 if (hydrateGen !== this.snapshotHydrateGen)
@@ -479,7 +495,7 @@ export class FireProvider extends ObservableV2 {
                     }
                     catch (error) {
                         this.consoleHandler("Firestore sync error", error);
-                        this.scheduleSnapshotRetry();
+                        this.scheduleHydrateRetry();
                         return false;
                     }
                     if (hydrateGen !== this.snapshotHydrateGen)
@@ -502,7 +518,7 @@ export class FireProvider extends ObservableV2 {
                     }
                     catch (error) {
                         this.consoleHandler("Firestore sync error", error);
-                        this.scheduleSnapshotRetry();
+                        this.scheduleHydrateRetry();
                         return false;
                     }
                 }
