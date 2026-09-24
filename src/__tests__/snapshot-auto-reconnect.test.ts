@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
+  emitSnapshot,
   emitSnapshotError,
+  emitUpdatesSnapshot,
   onSnapshotCallCount,
   resetFirestoreMock,
 } from "./_mocks/firestore";
@@ -40,6 +42,46 @@ describe("snapshot auto-reconnect", () => {
     provider.trackData();
 
     expect(onSnapshotCallCount).toBeGreaterThan(callsBefore);
+  });
+
+  it("backs off a persistently failing snapshotStore read across re-subscribes", async () => {
+    const denied = Object.assign(new Error("storage/unauthorized"), {
+      code: "storage/unauthorized",
+    });
+    const read = vi.fn(async () => {
+      throw denied;
+    });
+    await createTestProvider({
+      snapshotStore: { read, write: vi.fn() },
+    });
+    const shard = {
+      snapshotBackend: "storage",
+      contentStoragePath: "snap/0",
+    };
+    // Like Firestore, every (re)subscribe first delivers the cached doc and
+    // updates snapshots, whose success handlers reset the listener backoff.
+    const deliverCachedSnapshots = async () => {
+      emitSnapshot(TEST_PATH, {
+        exists: () => true,
+        data: () => shard,
+        metadata: { fromCache: true, hasPendingWrites: false },
+      });
+      emitUpdatesSnapshot(TEST_PATH, { fromCache: true, hasPendingWrites: false });
+      await flushMicrotasks();
+    };
+
+    await deliverCachedSnapshots();
+    expect(read).toHaveBeenCalledTimes(1);
+
+    for (const delay of [500, 1000, 2000, 4000]) {
+      const subscribesBefore = onSnapshotCallCount;
+      await vi.advanceTimersByTimeAsync(delay - 1);
+      expect(onSnapshotCallCount).toBe(subscribesBefore);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(onSnapshotCallCount).toBe(subscribesBefore + 2);
+      await deliverCachedSnapshots();
+    }
+    expect(read).toHaveBeenCalledTimes(5);
   });
 
   it("permission-denied triggers onDeleted and does not retry", async () => {
