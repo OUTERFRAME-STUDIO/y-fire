@@ -2,4 +2,5 @@ export { FireProvider } from "./provider";
 export type { Parameters as FireProviderConfig, FireSaveContext, FireSaveReason, FireSavePhase, EpochReplaceEvent, SnapshotMeta, SnapshotStore, } from "./provider";
 export type { PersistenceMode } from "./persistence";
 export { FIRESTORE_CONTENT_MAX_BYTES, FIRESTORE_CONTENT_WARN_BYTES, contentSizeKind, } from "./firestore-limits";
+export { EpochMismatchError, updateEpochMatches } from "./append-store";
 //# sourceMappingURL=index.d.ts.map

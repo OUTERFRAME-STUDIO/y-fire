@@ -4,6 +4,7 @@ import {
   collection,
   doc,
   Firestore,
+  getDoc,
   getDocs,
   runTransaction,
   serverTimestamp,
@@ -54,6 +55,51 @@ export type WriteSnapshotResult = {
 
 export function updatesCollectionPath(documentPath: string): string {
   return `${documentPath}/${UPDATES_SUBCOLLECTION}`;
+}
+
+/**
+ * Legacy update docs omit `epoch` and must still apply. A numeric epoch
+ * applies only when it equals the shard's current epoch.
+ */
+export function updateEpochMatches(
+  docEpoch: unknown,
+  currentEpoch: number,
+): boolean {
+  if (typeof docEpoch !== "number") return true;
+  return docEpoch === currentEpoch;
+}
+
+export class EpochMismatchError extends Error {
+  readonly expected: number;
+  readonly actual: number;
+
+  constructor(expected: number, actual: number) {
+    super(
+      `y-fire: epoch mismatch (expected ${expected}, actual ${actual})`,
+    );
+    this.name = "EpochMismatchError";
+    this.expected = expected;
+    this.actual = actual;
+  }
+}
+
+function shardEpoch(
+  data: Record<string, unknown> | undefined,
+  epochField: string,
+): number {
+  const value = data?.[epochField];
+  return typeof value === "number" ? value : 0;
+}
+
+function assertExpectedShardEpoch(
+  data: Record<string, unknown> | undefined,
+  expectedEpoch: number,
+  epochField: string,
+): void {
+  const actual = shardEpoch(data, epochField);
+  if (actual !== expectedEpoch) {
+    throw new EpochMismatchError(expectedEpoch, actual);
+  }
 }
 
 export function isAlreadyExistsError(error: unknown): boolean {
@@ -198,12 +244,18 @@ export function unionYjsBytes(
 export async function appendUpdate(
   db: Firestore,
   documentPath: string,
-  payload: { update: Uint8Array; seq: number; clientId?: string },
+  payload: {
+    update: Uint8Array;
+    seq: number;
+    clientId?: string;
+    epoch: number;
+  },
 ) {
   const col = collection(db, updatesCollectionPath(documentPath));
   return addDoc(col, {
     update: Bytes.fromUint8Array(payload.update),
     seq: payload.seq,
+    epoch: payload.epoch,
     ...(payload.clientId ? { clientId: payload.clientId } : {}),
     createdAt: serverTimestamp(),
   });
@@ -212,7 +264,13 @@ export async function appendUpdate(
 export async function listUpdates(
   db: Firestore,
   documentPath: string,
+  epochField: string = DEFAULT_EPOCH_FIELD,
 ): Promise<ListedUpdate[]> {
+  const shard = await getDoc(doc(db, documentPath));
+  const shardData = shard.exists()
+    ? (shard.data() as Record<string, unknown> | undefined)
+    : undefined;
+  const currentEpoch = shardEpoch(shardData, epochField);
   const col = collection(db, updatesCollectionPath(documentPath));
   const snap = await getDocs(col);
   const out: ListedUpdate[] = [];
@@ -222,6 +280,7 @@ export async function listUpdates(
       | undefined;
     const update = readBytes(data?.update);
     if (!update) return;
+    if (!updateEpochMatches(data?.epoch, currentEpoch)) return;
     out.push({
       id: d.id,
       update,
@@ -280,7 +339,10 @@ export async function writeSnapshot(opts: {
   content: Uint8Array;
   documentMapper: (bytes: Bytes) => object;
   snapshotStore?: SnapshotStore;
+  expectedEpoch: number;
+  epochField?: string;
 }): Promise<WriteSnapshotResult> {
+  const epochField = opts.epochField ?? DEFAULT_EPOCH_FIELD;
   const ref = doc(opts.db, opts.documentPath);
   let outcome: "written" | "exists" = "written";
   let stored: SnapshotMeta | undefined;
@@ -294,6 +356,7 @@ export async function writeSnapshot(opts: {
     await runTransaction(opts.db, async (tx) => {
       const snap = await tx.get(ref);
       const data = snap.data() as Record<string, unknown> | undefined;
+      assertExpectedShardEpoch(data, opts.expectedEpoch, epochField);
       alreadyExists = hasExistingSnapshot(data);
       if (alreadyExists) {
         existingSv = snapshotSvFromShardData(data);
@@ -312,6 +375,7 @@ export async function writeSnapshot(opts: {
   await runTransaction(opts.db, async (tx) => {
     const snap = await tx.get(ref);
     const data = snap.data() as Record<string, unknown> | undefined;
+    assertExpectedShardEpoch(data, opts.expectedEpoch, epochField);
     if (hasExistingSnapshot(data)) {
       outcome = "exists";
       existingSv = snapshotSvFromShardData(data);
@@ -361,16 +425,21 @@ export async function foldUpdates(opts: {
   maxContentBytes: number;
   force?: boolean;
   snapshotStore?: SnapshotStore;
+  expectedEpoch: number;
+  epochField?: string;
 }): Promise<FoldResult> {
+  const epochField = opts.epochField ?? DEFAULT_EPOCH_FIELD;
   if (opts.listed.length === 0 && !opts.force) return { status: "empty" };
   const ref = doc(opts.db, opts.documentPath);
   if (opts.snapshotStore) {
-    return foldUpdatesWithStore(opts, ref, opts.snapshotStore);
+    return foldUpdatesWithStore(opts, ref, opts.snapshotStore, epochField);
   }
   let result: FoldResult = { status: "empty" };
   await runTransaction(opts.db, async (tx) => {
     const snap = await tx.get(ref);
-    const remote = readBytes(snap.data()?.content);
+    const data = snap.data() as Record<string, unknown> | undefined;
+    assertExpectedShardEpoch(data, opts.expectedEpoch, epochField);
+    const remote = readBytes(data?.content);
     const snapshot = unionYjsBytes([
       remote,
       ...opts.listed.map((u) => u.update),
@@ -416,16 +485,18 @@ async function foldUpdatesWithStore(
     documentPath: string;
     listed: ListedUpdate[];
     localUpdate: Uint8Array;
+    expectedEpoch: number;
   },
   ref: ReturnType<typeof doc>,
   snapshotStore: SnapshotStore,
+  epochField: string,
 ): Promise<FoldResult> {
   let remoteMeta = readSnapshotMeta(undefined);
   await runTransaction(opts.db, async (tx) => {
     const snap = await tx.get(ref);
-    remoteMeta = readSnapshotMeta(
-      snap.data() as Record<string, unknown> | undefined,
-    );
+    const data = snap.data() as Record<string, unknown> | undefined;
+    assertExpectedShardEpoch(data, opts.expectedEpoch, epochField);
+    remoteMeta = readSnapshotMeta(data);
   });
   let remote: Uint8Array | undefined;
   const storedMeta = snapshotMetaFromFields(remoteMeta);
@@ -440,6 +511,9 @@ async function foldUpdatesWithStore(
   const written = await snapshotStore.write(snapshot);
   let result: FoldResult = { status: "empty" };
   await runTransaction(opts.db, async (tx) => {
+    const snap = await tx.get(ref);
+    const data = snap.data() as Record<string, unknown> | undefined;
+    assertExpectedShardEpoch(data, opts.expectedEpoch, epochField);
     tx.set(
       ref,
       {

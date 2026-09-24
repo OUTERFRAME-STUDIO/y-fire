@@ -7,7 +7,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
         step((generator = generator.apply(thisArg, _arguments || [])).next());
     });
 };
-import { addDoc, Bytes, collection, doc, getDocs, runTransaction, serverTimestamp, } from "@firebase/firestore";
+import { addDoc, Bytes, collection, doc, getDoc, getDocs, runTransaction, serverTimestamp, } from "@firebase/firestore";
 import * as Y from "yjs";
 import { contentSizeKind } from "./firestore-limits";
 export const UPDATES_SUBCOLLECTION = "updates";
@@ -23,6 +23,33 @@ export const DEFAULT_FOLD_UPDATE_THRESHOLD = 20;
 export const DEFAULT_FOLD_BYTES_FRACTION = 0.5;
 export function updatesCollectionPath(documentPath) {
     return `${documentPath}/${UPDATES_SUBCOLLECTION}`;
+}
+/**
+ * Legacy update docs omit `epoch` and must still apply. A numeric epoch
+ * applies only when it equals the shard's current epoch.
+ */
+export function updateEpochMatches(docEpoch, currentEpoch) {
+    if (typeof docEpoch !== "number")
+        return true;
+    return docEpoch === currentEpoch;
+}
+export class EpochMismatchError extends Error {
+    constructor(expected, actual) {
+        super(`y-fire: epoch mismatch (expected ${expected}, actual ${actual})`);
+        this.name = "EpochMismatchError";
+        this.expected = expected;
+        this.actual = actual;
+    }
+}
+function shardEpoch(data, epochField) {
+    const value = data === null || data === void 0 ? void 0 : data[epochField];
+    return typeof value === "number" ? value : 0;
+}
+function assertExpectedShardEpoch(data, expectedEpoch, epochField) {
+    const actual = shardEpoch(data, epochField);
+    if (actual !== expectedEpoch) {
+        throw new EpochMismatchError(expectedEpoch, actual);
+    }
 }
 export function isAlreadyExistsError(error) {
     if (!error || typeof error !== "object")
@@ -128,11 +155,16 @@ export function unionYjsBytes(parts) {
 export function appendUpdate(db, documentPath, payload) {
     return __awaiter(this, void 0, void 0, function* () {
         const col = collection(db, updatesCollectionPath(documentPath));
-        return addDoc(col, Object.assign(Object.assign({ update: Bytes.fromUint8Array(payload.update), seq: payload.seq }, (payload.clientId ? { clientId: payload.clientId } : {})), { createdAt: serverTimestamp() }));
+        return addDoc(col, Object.assign(Object.assign({ update: Bytes.fromUint8Array(payload.update), seq: payload.seq, epoch: payload.epoch }, (payload.clientId ? { clientId: payload.clientId } : {})), { createdAt: serverTimestamp() }));
     });
 }
-export function listUpdates(db, documentPath) {
+export function listUpdates(db, documentPath, epochField = DEFAULT_EPOCH_FIELD) {
     return __awaiter(this, void 0, void 0, function* () {
+        const shard = yield getDoc(doc(db, documentPath));
+        const shardData = shard.exists()
+            ? shard.data()
+            : undefined;
+        const currentEpoch = shardEpoch(shardData, epochField);
         const col = collection(db, updatesCollectionPath(documentPath));
         const snap = yield getDocs(col);
         const out = [];
@@ -140,6 +172,8 @@ export function listUpdates(db, documentPath) {
             const data = (typeof d.data === "function" ? d.data() : undefined);
             const update = readBytes(data === null || data === void 0 ? void 0 : data.update);
             if (!update)
+                return;
+            if (!updateEpochMatches(data === null || data === void 0 ? void 0 : data.epoch, currentEpoch))
                 return;
             out.push({
                 id: d.id,
@@ -177,7 +211,9 @@ export function stampSnapshotMeta(opts) {
     });
 }
 export function writeSnapshot(opts) {
+    var _a;
     return __awaiter(this, void 0, void 0, function* () {
+        const epochField = (_a = opts.epochField) !== null && _a !== void 0 ? _a : DEFAULT_EPOCH_FIELD;
         const ref = doc(opts.db, opts.documentPath);
         let outcome = "written";
         let stored;
@@ -191,6 +227,7 @@ export function writeSnapshot(opts) {
             yield runTransaction(opts.db, (tx) => __awaiter(this, void 0, void 0, function* () {
                 const snap = yield tx.get(ref);
                 const data = snap.data();
+                assertExpectedShardEpoch(data, opts.expectedEpoch, epochField);
                 alreadyExists = hasExistingSnapshot(data);
                 if (alreadyExists) {
                     existingSv = snapshotSvFromShardData(data);
@@ -209,6 +246,7 @@ export function writeSnapshot(opts) {
         yield runTransaction(opts.db, (tx) => __awaiter(this, void 0, void 0, function* () {
             const snap = yield tx.get(ref);
             const data = snap.data();
+            assertExpectedShardEpoch(data, opts.expectedEpoch, epochField);
             if (hasExistingSnapshot(data)) {
                 outcome = "exists";
                 existingSv = snapshotSvFromShardData(data);
@@ -225,18 +263,21 @@ export function writeSnapshot(opts) {
     });
 }
 export function foldUpdates(opts) {
+    var _a;
     return __awaiter(this, void 0, void 0, function* () {
+        const epochField = (_a = opts.epochField) !== null && _a !== void 0 ? _a : DEFAULT_EPOCH_FIELD;
         if (opts.listed.length === 0 && !opts.force)
             return { status: "empty" };
         const ref = doc(opts.db, opts.documentPath);
         if (opts.snapshotStore) {
-            return foldUpdatesWithStore(opts, ref, opts.snapshotStore);
+            return foldUpdatesWithStore(opts, ref, opts.snapshotStore, epochField);
         }
         let result = { status: "empty" };
         yield runTransaction(opts.db, (tx) => __awaiter(this, void 0, void 0, function* () {
-            var _a;
             const snap = yield tx.get(ref);
-            const remote = readBytes((_a = snap.data()) === null || _a === void 0 ? void 0 : _a.content);
+            const data = snap.data();
+            assertExpectedShardEpoch(data, opts.expectedEpoch, epochField);
+            const remote = readBytes(data === null || data === void 0 ? void 0 : data.content);
             const snapshot = unionYjsBytes([
                 remote,
                 ...opts.listed.map((u) => u.update),
@@ -261,12 +302,14 @@ export function foldUpdates(opts) {
         return result;
     });
 }
-function foldUpdatesWithStore(opts, ref, snapshotStore) {
+function foldUpdatesWithStore(opts, ref, snapshotStore, epochField) {
     return __awaiter(this, void 0, void 0, function* () {
         let remoteMeta = readSnapshotMeta(undefined);
         yield runTransaction(opts.db, (tx) => __awaiter(this, void 0, void 0, function* () {
             const snap = yield tx.get(ref);
-            remoteMeta = readSnapshotMeta(snap.data());
+            const data = snap.data();
+            assertExpectedShardEpoch(data, opts.expectedEpoch, epochField);
+            remoteMeta = readSnapshotMeta(data);
         }));
         let remote;
         const storedMeta = snapshotMetaFromFields(remoteMeta);
@@ -281,6 +324,9 @@ function foldUpdatesWithStore(opts, ref, snapshotStore) {
         const written = yield snapshotStore.write(snapshot);
         let result = { status: "empty" };
         yield runTransaction(opts.db, (tx) => __awaiter(this, void 0, void 0, function* () {
+            const snap = yield tx.get(ref);
+            const data = snap.data();
+            assertExpectedShardEpoch(data, opts.expectedEpoch, epochField);
             tx.set(ref, Object.assign(Object.assign({}, snapshotStoreDocFields(written)), { [SNAPSHOT_SV_FIELD]: Bytes.fromUint8Array(Y.encodeStateVectorFromUpdate(snapshot)), updatedAt: serverTimestamp() }), { merge: true });
             for (const update of opts.listed) {
                 tx.delete(doc(opts.db, `${updatesCollectionPath(opts.documentPath)}/${update.id}`));

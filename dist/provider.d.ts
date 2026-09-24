@@ -129,6 +129,8 @@ export declare class FireProvider extends ObservableV2<any> {
     private lastSnapshotFromCache;
     private hasRemoteContent;
     private hydratedEpoch?;
+    /** Latest epoch field value seen by the shard listener, including a replace. */
+    private latestObservedEpoch?;
     private epochReplaced;
     private appliedUpdateIds;
     private lastSeq;
@@ -148,6 +150,7 @@ export declare class FireProvider extends ObservableV2<any> {
     private foldAbortReported;
     private updatesAccessDenied;
     private updatesDeniedWarned;
+    private lastUpdatesSnapshot?;
     private snapshotStore?;
     private snapshotHydrateGen;
     get clientTimeOffset(): number;
@@ -172,6 +175,16 @@ export declare class FireProvider extends ObservableV2<any> {
     private scheduleMeshRetry;
     private maybeBecomeServerReady;
     private applyRemoteUpdateBytes;
+    private enterEpochReplace;
+    /**
+     * Refuse Firestore content/update writes until a server snapshot has
+     * pinned an epoch, and stop once this replica has been replaced.
+     * A newer epoch observed by the doc listener takes the replace path
+     * before any write.
+     */
+    private assertCanWriteFirestore;
+    private replayObservedUpdates;
+    private consumeUpdatesSnapshot;
     trackData: () => void;
     private handleDocSnapshot;
     /**

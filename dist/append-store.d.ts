@@ -40,6 +40,16 @@ export type WriteSnapshotResult = {
     contentStoragePath?: string;
 };
 export declare function updatesCollectionPath(documentPath: string): string;
+/**
+ * Legacy update docs omit `epoch` and must still apply. A numeric epoch
+ * applies only when it equals the shard's current epoch.
+ */
+export declare function updateEpochMatches(docEpoch: unknown, currentEpoch: number): boolean;
+export declare class EpochMismatchError extends Error {
+    readonly expected: number;
+    readonly actual: number;
+    constructor(expected: number, actual: number);
+}
 export declare function isAlreadyExistsError(error: unknown): boolean;
 export declare function updateIdFromAlreadyExistsError(error: unknown): string | undefined;
 export declare function readBytes(value: unknown): Uint8Array | undefined;
@@ -71,8 +81,9 @@ export declare function appendUpdate(db: Firestore, documentPath: string, payloa
     update: Uint8Array;
     seq: number;
     clientId?: string;
+    epoch: number;
 }): Promise<import("@firebase/firestore").DocumentReference<import("@firebase/firestore").DocumentData, import("@firebase/firestore").DocumentData>>;
-export declare function listUpdates(db: Firestore, documentPath: string): Promise<ListedUpdate[]>;
+export declare function listUpdates(db: Firestore, documentPath: string, epochField?: string): Promise<ListedUpdate[]>;
 /**
  * Repair a missing Storage pointer after a successful `readDefault`.
  * Merge-only; no-ops when the shard already has a path or `content`.
@@ -89,6 +100,8 @@ export declare function writeSnapshot(opts: {
     content: Uint8Array;
     documentMapper: (bytes: Bytes) => object;
     snapshotStore?: SnapshotStore;
+    expectedEpoch: number;
+    epochField?: string;
 }): Promise<WriteSnapshotResult>;
 export type FoldResult = {
     status: "ok";
@@ -110,5 +123,7 @@ export declare function foldUpdates(opts: {
     maxContentBytes: number;
     force?: boolean;
     snapshotStore?: SnapshotStore;
+    expectedEpoch: number;
+    epochField?: string;
 }): Promise<FoldResult>;
 //# sourceMappingURL=append-store.d.ts.map

@@ -14,3 +14,4 @@ export {
   FIRESTORE_CONTENT_WARN_BYTES,
   contentSizeKind,
 } from "./firestore-limits";
+export { EpochMismatchError, updateEpochMatches } from "./append-store";
