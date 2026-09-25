@@ -177,6 +177,12 @@ export declare class FireProvider extends ObservableV2<any> {
     private applyRemoteUpdateBytes;
     private enterEpochReplace;
     /**
+     * Server epoch when it is strictly newer than this replica's hydrate.
+     * `null` means the epoch did not advance, or the server read failed —
+     * the caller must rethrow the original append error.
+     */
+    private epochAdvancedOnServer;
+    /**
      * Refuse Firestore content/update writes until a server snapshot has
      * pinned an epoch, and stop once this replica has been replaced.
      * A newer epoch observed by the doc listener takes the replace path

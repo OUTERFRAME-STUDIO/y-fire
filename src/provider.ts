@@ -6,6 +6,7 @@ import {
   onSnapshot,
   doc,
   collection,
+  getDocFromServer,
   type Bytes,
 } from "@firebase/firestore";
 import * as Y from "yjs";
@@ -420,6 +421,29 @@ export class FireProvider extends ObservableV2<any> {
     this.epochReplaced = true;
     void this.deleteLocal();
     if (this.onEpochReplace) this.onEpochReplace({ from, to });
+  }
+
+  /**
+   * Server epoch when it is strictly newer than this replica's hydrate.
+   * `null` means the epoch did not advance, or the server read failed —
+   * the caller must rethrow the original append error.
+   */
+  private async epochAdvancedOnServer(): Promise<number | null> {
+    try {
+      const snap = await getDocFromServer(doc(this.db, this.documentPath));
+      const epoch = snap.exists()
+        ? readSnapshotMeta(
+            snap.data() as Record<string, unknown> | undefined,
+            this.epochField,
+          ).epoch
+        : 0;
+      if (this.hydratedEpoch === undefined || epoch <= this.hydratedEpoch) {
+        return null;
+      }
+      return epoch;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -1248,16 +1272,16 @@ export class FireProvider extends ObservableV2<any> {
       if (isAlreadyExistsError(error)) {
         const id = updateIdFromAlreadyExistsError(error);
         result = id ? { id } : undefined;
-      } else if (isAppendEpochFenceError(error)) {
-        const to =
-          error instanceof EpochMismatchError
-            ? error.actual
-            : this.latestObservedEpoch !== undefined &&
-                this.latestObservedEpoch !== this.hydratedEpoch
-              ? this.latestObservedEpoch
-              : (this.hydratedEpoch ?? 0);
-        this.enterEpochReplace(to);
+      } else if (error instanceof EpochMismatchError) {
+        this.enterEpochReplace(error.actual);
         return;
+      } else if (isAppendEpochFenceError(error)) {
+        const advanced = await this.epochAdvancedOnServer();
+        if (advanced !== null) {
+          this.enterEpochReplace(advanced);
+          return;
+        }
+        throw error;
       } else {
         throw error;
       }

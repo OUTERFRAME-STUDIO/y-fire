@@ -1,15 +1,18 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import * as Y from "yjs";
 import {
+  addDoc,
   addDocCalls,
   emitSnapshot,
   emitUpdatesSnapshot,
   firestoreCollections,
   firestoreDocs,
+  getDocFromServer,
   runTransaction,
   seedFirestoreUpdate,
   setAddDocError,
   setDocCalls,
+  setGetDocFromServerError,
   updatesPath,
 } from "./_mocks/firestore";
 import {
@@ -21,7 +24,11 @@ import {
   whenTabFoldsIdle,
   FireProvider,
 } from "./helpers";
-import { listUpdates, updateEpochMatches } from "../append-store";
+import {
+  EpochMismatchError,
+  listUpdates,
+  updateEpochMatches,
+} from "../append-store";
 
 function baseAndLegacy(): { snapshot: Uint8Array; legacy: Uint8Array } {
   const base = new Y.Doc();
@@ -40,6 +47,7 @@ describe("epoch fence", () => {
   beforeEach(() => {
     vi.spyOn(console, "log").mockImplementation(() => {});
     setAddDocError(null);
+    setGetDocFromServerError(null);
     provider = undefined;
   });
 
@@ -184,6 +192,7 @@ describe("epoch fence", () => {
     expect(setDocCalls.length).toBe(0);
     expect(addDocCalls.length).toBe(0);
     expect(onSaveError).not.toHaveBeenCalled();
+    expect(getDocFromServer).not.toHaveBeenCalled();
   });
 
   it("enters epoch replace on EpochMismatchError during fold and does not retry", async () => {
@@ -211,10 +220,65 @@ describe("epoch fence", () => {
     expect(onEpochReplace).toHaveBeenCalledWith({ from: 1, to: 5 });
     expect(runTransaction.mock.calls.length).toBe(transactions);
     expect(addDocCalls.length).toBe(1);
+    expect(getDocFromServer).not.toHaveBeenCalled();
     remote.destroy();
   });
 
-  it("treats permission-denied on appendUpdate as an epoch fence", async () => {
+  function permissionDenied() {
+    return Object.assign(new Error("Missing or insufficient permissions."), {
+      code: "permission-denied",
+    });
+  }
+
+  it("retries a permission-denied append when the server epoch is unchanged", async () => {
+    vi.useFakeTimers();
+    const remote = new Y.Doc();
+    remote.getText("t").insert(0, "base");
+    const created = await createTestProvider({ maxWaitFirestoreTime: 20 });
+    provider = created.provider;
+    const onEpochReplace = vi.fn();
+    const onSaveError = vi.fn();
+    provider.onEpochReplace = onEpochReplace;
+    provider.onSaveError = onSaveError;
+    emitServerUpdate(TEST_PATH, Y.encodeStateAsUpdate(remote), { epoch: 2 });
+    await flushMicrotasks();
+
+    setAddDocError(permissionDenied());
+    const svBefore = (
+      provider as unknown as { lastPersistedSV?: Uint8Array }
+    ).lastPersistedSV;
+    created.ydoc.getText("t").insert(4, "Z");
+    await provider.saveToFirestore();
+
+    expect(onEpochReplace).not.toHaveBeenCalled();
+    expect(onSaveError).toHaveBeenCalled();
+    expect(onSaveError.mock.calls[0]?.[1]).toMatchObject({
+      reason: "save-failed",
+    });
+    expect(onSaveError.mock.calls[0]?.[0]).toMatchObject({
+      code: "permission-denied",
+    });
+    expect(
+      (provider as unknown as { epochReplaced: boolean }).epochReplaced,
+    ).toBe(false);
+    expect(created.ydoc.getText("t").toString()).toBe("baseZ");
+    expect(
+      (provider as unknown as { lastPersistedSV?: Uint8Array }).lastPersistedSV,
+    ).toEqual(svBefore);
+    expect(addDoc.mock.calls.length).toBe(1);
+    expect(getDocFromServer).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(20);
+    await vi.advanceTimersByTimeAsync(20);
+    await flushMicrotasks();
+
+    expect(addDoc.mock.calls.length).toBeGreaterThan(1);
+    expect(onEpochReplace).not.toHaveBeenCalled();
+    expect(created.ydoc.getText("t").toString()).toBe("baseZ");
+    remote.destroy();
+  });
+
+  it("replaces on permission-denied only after the server epoch advances", async () => {
     const remote = new Y.Doc();
     remote.getText("t").insert(0, "base");
     const created = await createTestProvider();
@@ -226,20 +290,72 @@ describe("epoch fence", () => {
     emitServerUpdate(TEST_PATH, Y.encodeStateAsUpdate(remote), { epoch: 2 });
     await flushMicrotasks();
 
-    setAddDocError(
-      Object.assign(new Error("Missing or insufficient permissions."), {
-        code: "permission-denied",
-      }),
-    );
+    firestoreDocs.get(TEST_PATH)!.contentGeneration = 9;
+    setAddDocError(permissionDenied());
     created.ydoc.getText("t").insert(4, "Z");
-    await provider.saveToFirestore();
-    setAddDocError(null);
     await provider.saveToFirestore();
 
     expect(onEpochReplace).toHaveBeenCalledTimes(1);
-    expect(onEpochReplace).toHaveBeenCalledWith({ from: 2, to: 2 });
-    expect(addDocCalls.length).toBe(0);
+    expect(onEpochReplace).toHaveBeenCalledWith({ from: 2, to: 9 });
     expect(onSaveError).not.toHaveBeenCalled();
+    expect(getDocFromServer).toHaveBeenCalledTimes(1);
+    expect(addDocCalls.length).toBe(0);
+    remote.destroy();
+  });
+
+  it("treats a failed server epoch read after permission-denied as a save failure", async () => {
+    const remote = new Y.Doc();
+    remote.getText("t").insert(0, "base");
+    const created = await createTestProvider();
+    provider = created.provider;
+    const onEpochReplace = vi.fn();
+    const onSaveError = vi.fn();
+    provider.onEpochReplace = onEpochReplace;
+    provider.onSaveError = onSaveError;
+    emitServerUpdate(TEST_PATH, Y.encodeStateAsUpdate(remote), { epoch: 2 });
+    await flushMicrotasks();
+
+    firestoreDocs.get(TEST_PATH)!.contentGeneration = 9;
+    setGetDocFromServerError(new Error("server read failed"));
+    setAddDocError(permissionDenied());
+    created.ydoc.getText("t").insert(4, "Z");
+    await provider.saveToFirestore();
+
+    expect(onEpochReplace).not.toHaveBeenCalled();
+    expect(onSaveError).toHaveBeenCalled();
+    expect(onSaveError.mock.calls[0]?.[1]).toMatchObject({
+      reason: "save-failed",
+    });
+    expect(onSaveError.mock.calls[0]?.[0]).toMatchObject({
+      code: "permission-denied",
+    });
+    expect(
+      (provider as unknown as { epochReplaced: boolean }).epochReplaced,
+    ).toBe(false);
+    expect(created.ydoc.getText("t").toString()).toBe("baseZ");
+    remote.destroy();
+  });
+
+  it("replaces immediately on EpochMismatchError from appendUpdate without a server read", async () => {
+    const remote = new Y.Doc();
+    remote.getText("t").insert(0, "base");
+    const created = await createTestProvider();
+    provider = created.provider;
+    const onEpochReplace = vi.fn();
+    const onSaveError = vi.fn();
+    provider.onEpochReplace = onEpochReplace;
+    provider.onSaveError = onSaveError;
+    emitServerUpdate(TEST_PATH, Y.encodeStateAsUpdate(remote), { epoch: 2 });
+    await flushMicrotasks();
+
+    setAddDocError(new EpochMismatchError(2, 6));
+    created.ydoc.getText("t").insert(4, "Z");
+    await provider.saveToFirestore();
+
+    expect(onEpochReplace).toHaveBeenCalledTimes(1);
+    expect(onEpochReplace).toHaveBeenCalledWith({ from: 2, to: 6 });
+    expect(onSaveError).not.toHaveBeenCalled();
+    expect(getDocFromServer).not.toHaveBeenCalled();
     remote.destroy();
   });
 

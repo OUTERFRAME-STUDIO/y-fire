@@ -7,7 +7,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
         step((generator = generator.apply(thisArg, _arguments || [])).next());
     });
 };
-import { getFirestore, onSnapshot, doc, collection, } from "@firebase/firestore";
+import { getFirestore, onSnapshot, doc, collection, getDocFromServer, } from "@firebase/firestore";
 import * as Y from "yjs";
 import { ObservableV2 } from "lib0/observable";
 import * as awarenessProtocol from "y-protocols/awareness";
@@ -50,6 +50,28 @@ export class FireProvider extends ObservableV2 {
         void this.deleteLocal();
         if (this.onEpochReplace)
             this.onEpochReplace({ from, to });
+    }
+    /**
+     * Server epoch when it is strictly newer than this replica's hydrate.
+     * `null` means the epoch did not advance, or the server read failed —
+     * the caller must rethrow the original append error.
+     */
+    epochAdvancedOnServer() {
+        return __awaiter(this, void 0, void 0, function* () {
+            try {
+                const snap = yield getDocFromServer(doc(this.db, this.documentPath));
+                const epoch = snap.exists()
+                    ? readSnapshotMeta(snap.data(), this.epochField).epoch
+                    : 0;
+                if (this.hydratedEpoch === undefined || epoch <= this.hydratedEpoch) {
+                    return null;
+                }
+                return epoch;
+            }
+            catch (_a) {
+                return null;
+            }
+        });
     }
     /**
      * Refuse Firestore content/update writes until a server snapshot has
@@ -1004,7 +1026,6 @@ export class FireProvider extends ObservableV2 {
             this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, svAtEncode);
         });
         this.appendDelta = (localUpdate) => __awaiter(this, void 0, void 0, function* () {
-            var _f;
             if (this.updatesAccessDenied) {
                 yield this.writeForcedSnapshot(localUpdate);
                 return;
@@ -1036,15 +1057,17 @@ export class FireProvider extends ObservableV2 {
                     const id = updateIdFromAlreadyExistsError(error);
                     result = id ? { id } : undefined;
                 }
-                else if (isAppendEpochFenceError(error)) {
-                    const to = error instanceof EpochMismatchError
-                        ? error.actual
-                        : this.latestObservedEpoch !== undefined &&
-                            this.latestObservedEpoch !== this.hydratedEpoch
-                            ? this.latestObservedEpoch
-                            : ((_f = this.hydratedEpoch) !== null && _f !== void 0 ? _f : 0);
-                    this.enterEpochReplace(to);
+                else if (error instanceof EpochMismatchError) {
+                    this.enterEpochReplace(error.actual);
                     return;
+                }
+                else if (isAppendEpochFenceError(error)) {
+                    const advanced = yield this.epochAdvancedOnServer();
+                    if (advanced !== null) {
+                        this.enterEpochReplace(advanced);
+                        return;
+                    }
+                    throw error;
                 }
                 else {
                     throw error;
