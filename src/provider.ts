@@ -81,6 +81,24 @@ export interface EpochReplaceEvent {
   to: number;
 }
 
+/** Synchronous main-thread work the provider does on a shard. */
+export type MainThreadWorkPhase =
+  /** Full-doc encode for the IndexedDB copy. */
+  | "local-encode"
+  /** Full-doc encode for a snapshot write or a fold. */
+  | "full-encode"
+  /** Delta encode for an `updates/*` append. */
+  | "delta-encode"
+  /** Applying Firestore bytes, including the doc's observers. */
+  | "remote-apply";
+
+export interface MainThreadWorkEvent {
+  documentPath: string;
+  phase: MainThreadWorkPhase;
+  ms: number;
+  bytes: number;
+}
+
 export interface Parameters {
   firebaseApp: FirebaseApp;
   ydoc: Y.Doc;
@@ -111,6 +129,11 @@ export interface Parameters {
    * the shard doc holds metadata only. WAL `updates/*` is unchanged.
    */
   snapshotStore?: SnapshotStore;
+  /**
+   * Called after each encode or remote apply with its duration, so a host
+   * can log the work that blocks the main thread on large shards.
+   */
+  onMainThreadWork?: (event: MainThreadWorkEvent) => void;
 }
 
 interface PeersRTC {
@@ -127,6 +150,14 @@ const SNAPSHOT_BACKOFF_MAX_MS = 16_000;
 const FOLD_BACKOFF_MS = 30_000;
 /** Trailing debounce for full-doc IndexedDB encodes after local updates. */
 export const LOCAL_PERSIST_DEBOUNCE_MS = 500;
+/**
+ * Delay before caching remote (Firestore / peer) updates in IndexedDB. The
+ * server already holds them, so the local copy only warms the next open;
+ * each save is a full-doc encode on the main thread, which on a multi-MB
+ * shard costs hundreds of ms per remote update (DEV-358). A local edit or a
+ * hide / kill flush still saves them sooner.
+ */
+export const REMOTE_LOCAL_PERSIST_DELAY_MS = 10_000;
 
 /**
  * FireProvider class that handles firestore data sync and awareness
@@ -176,6 +207,8 @@ export class FireProvider extends ObservableV2<any> {
   saveWriteStartedAt?: number;
   lastLocalFlushMs: number | null = null;
   lastEncodeMs: number | null = null;
+  lastLocalEncodeMs: number | null = null;
+  onMainThreadWork?: (event: MainThreadWorkEvent) => void;
   lastSaveDurationMs: number | null = null;
   private saveQueued: boolean = false;
 
@@ -199,6 +232,11 @@ export class FireProvider extends ObservableV2<any> {
   private meshRetryTimeout?: ReturnType<typeof setTimeout>;
   private saveRetryTimeout?: ReturnType<typeof setTimeout>;
   private localPersistTimeout?: ReturnType<typeof setTimeout>;
+  private localPersistDueAt?: number;
+  /** Doc content not yet written to IndexedDB. */
+  private localSaveDirty: boolean = false;
+  /** A local edit (not a remote update) is among the unsaved content. */
+  private localEditUnsaved: boolean = false;
   private dataListenerPaused: boolean = false;
   private pendingSyncLocal: boolean = false;
   private lastPersistedSV?: Uint8Array;
@@ -220,7 +258,6 @@ export class FireProvider extends ObservableV2<any> {
   private listedUpdates: ListedUpdate[] = [];
   private foldInFlight: boolean = false;
   private foldQueued: boolean = false;
-  private pendingFoldLocal?: Uint8Array;
   private foldBackoffUntil?: number;
   private foldAbortedAtSnapshotSV?: Uint8Array;
   private foldAbortReported: boolean = false;
@@ -298,33 +335,75 @@ export class FireProvider extends ObservableV2<any> {
   };
 
   saveToLocal = async () => {
+    const hadLocalEdit = this.localEditUnsaved;
+    this.localSaveDirty = false;
+    this.localEditUnsaved = false;
     try {
+      const startedAt = Date.now();
       const currentDoc = Y.encodeStateAsUpdate(this.doc);
+      this.lastLocalEncodeMs = Date.now() - startedAt;
+      this.reportWork("local-encode", this.lastLocalEncodeMs, currentDoc);
       await this.persistenceAdapter.setLocal(this.documentPath, currentDoc);
       await this.persistenceAdapter.setLocal(
         persistenceMetaKey(this.documentPath),
         encodeEpochMeta(this.hydratedEpoch ?? 0),
       );
     } catch (e) {
+      this.localSaveDirty = true;
+      this.localEditUnsaved = this.localEditUnsaved || hadLocalEdit;
       this.consoleHandler("set local error", e);
     }
   };
 
-  private scheduleSaveToLocal = () => {
-    if (this.persistenceMode === "none") return;
+  private clearLocalPersistTimer = () => {
     if (this.localPersistTimeout) clearTimeout(this.localPersistTimeout);
-    this.localPersistTimeout = setTimeout(() => {
-      this.localPersistTimeout = undefined;
-      void this.saveToLocal();
-    }, LOCAL_PERSIST_DEBOUNCE_MS);
+    this.localPersistTimeout = undefined;
+    this.localPersistDueAt = undefined;
   };
 
-  flushSaveToLocal = async () => {
-    if (this.localPersistTimeout) {
-      clearTimeout(this.localPersistTimeout);
-      this.localPersistTimeout = undefined;
-    }
+  /**
+   * Local edits keep the trailing {@link LOCAL_PERSIST_DEBOUNCE_MS}
+   * debounce. Remote updates wait {@link REMOTE_LOCAL_PERSIST_DELAY_MS} and
+   * never push back a save that is already due sooner.
+   */
+  private scheduleSaveToLocal = (remote: boolean = false) => {
     if (this.persistenceMode === "none") return;
+    this.localSaveDirty = true;
+    if (!remote) this.localEditUnsaved = true;
+    const dueAt =
+      Date.now() +
+      (remote ? REMOTE_LOCAL_PERSIST_DELAY_MS : LOCAL_PERSIST_DEBOUNCE_MS);
+    if (
+      remote &&
+      this.localPersistTimeout &&
+      this.localPersistDueAt !== undefined &&
+      this.localPersistDueAt <= dueAt
+    ) {
+      return;
+    }
+    this.clearLocalPersistTimer();
+    this.localPersistDueAt = dueAt;
+    this.localPersistTimeout = setTimeout(() => {
+      this.localPersistTimeout = undefined;
+      this.localPersistDueAt = undefined;
+      void this.saveToLocal();
+    }, dueAt - Date.now());
+  };
+
+  /**
+   * Write unsaved content to IndexedDB now. A no-op when nothing changed
+   * since the last local save: every Firestore save flushes first, and a
+   * second full-doc encode of an unchanged doc is pure main-thread cost
+   * (DEV-358). `localEditsOnly` skips content that is only remote updates.
+   */
+  flushSaveToLocal = async (options: { localEditsOnly?: boolean } = {}) => {
+    if (this.persistenceMode === "none") {
+      this.clearLocalPersistTimer();
+      return;
+    }
+    if (!this.localSaveDirty) return;
+    if (options.localEditsOnly && !this.localEditUnsaved) return;
+    this.clearLocalPersistTimer();
     await this.saveToLocal();
   };
 
@@ -406,9 +485,29 @@ export class FireProvider extends ObservableV2<any> {
     void this.syncLocal();
   };
 
+  private reportWork = (
+    phase: MainThreadWorkPhase,
+    ms: number,
+    bytes: Uint8Array,
+  ) => {
+    if (!this.onMainThreadWork) return;
+    try {
+      this.onMainThreadWork({
+        documentPath: this.documentPath,
+        phase,
+        ms,
+        bytes: bytes.byteLength,
+      });
+    } catch (e) {
+      this.consoleHandler("onMainThreadWork error", e);
+    }
+  };
+
   private applyRemoteUpdateBytes = (bytes: Uint8Array) => {
     this.firebaseDataLastUpdatedAt = new Date().getTime();
+    const applyStartedAt = Date.now();
     Y.applyUpdate(this.doc, bytes, "origin:firebase/update");
+    this.reportWork("remote-apply", Date.now() - applyStartedAt, bytes);
     this.lastPersistedSV = mergeStateVectors(
       this.lastPersistedSV,
       stateVectorFromUpdate(bytes),
@@ -989,11 +1088,11 @@ export class FireProvider extends ObservableV2<any> {
       this.firestoreTimeout = undefined;
     }
     let flushQueuedAfterSuccess = false;
-    let foldAfterSave: Uint8Array | undefined;
+    let foldAfterSave = false;
     try {
       this.savePhase = "local-flush";
       const flushStartedAt = Date.now();
-      await this.flushSaveToLocal();
+      await this.flushSaveToLocal({ localEditsOnly: true });
       this.lastLocalFlushMs = Date.now() - flushStartedAt;
       if (!this.serverReady || this.epochReplaced) {
         this.saveQueued = false;
@@ -1005,15 +1104,15 @@ export class FireProvider extends ObservableV2<any> {
         return;
       }
       this.savePhase = "encode";
-      const encodeStartedAt = Date.now();
-      const localUpdate = Y.encodeStateAsUpdate(this.doc);
-      this.lastEncodeMs = Date.now() - encodeStartedAt;
       try {
         this.assertCanWriteFirestore();
         if (!this.hasRemoteContent) {
-          await this.writeFirstSnapshot(localUpdate);
+          await this.writeFirstSnapshot(this.encodeFullState());
         } else {
-          foldAfterSave = await this.appendDelta(localUpdate);
+          // A routine append only needs the delta. The full state is encoded
+          // lazily, by the paths that write a snapshot (DEV-358: on a large
+          // shard the eager encode cost ~100-150 ms of main thread per save).
+          foldAfterSave = await this.appendDelta();
         }
         this.scheduledFirstAt = undefined;
         await this.deleteLocal();
@@ -1024,7 +1123,7 @@ export class FireProvider extends ObservableV2<any> {
         if (this.onSaving) this.onSaving(false);
         flushQueuedAfterSuccess = this.saveQueued;
         this.saveQueued = false;
-        if (foldAfterSave) this.scheduleFold(foldAfterSave);
+        if (foldAfterSave) this.scheduleFold();
       } catch (error) {
         if (error instanceof FirestoreWriteDeferred) {
           this.saveQueued = true;
@@ -1058,7 +1157,11 @@ export class FireProvider extends ObservableV2<any> {
         if (this.onSaveError) {
           this.onSaveError(
             error,
-            this.saveContext(localUpdate.byteLength, saveReason, { code }),
+            this.saveContext(
+              Y.encodeStateAsUpdate(this.doc).byteLength,
+              saveReason,
+              { code },
+            ),
           );
         }
         this.scheduleSaveRetry();
@@ -1231,29 +1334,40 @@ export class FireProvider extends ObservableV2<any> {
           remoteSv,
         );
       }
-      await this.appendDelta(localUpdate);
+      await this.appendDelta();
       return;
     }
     this.hasRemoteContent = true;
     this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, svAtEncode);
   };
 
-  private appendDelta = async (
-    localUpdate: Uint8Array,
-  ): Promise<Uint8Array | undefined> => {
+  /** Full-state encode, timed into {@link lastEncodeMs}. */
+  private encodeFullState = (): Uint8Array => {
+    const encodeStartedAt = Date.now();
+    const bytes = Y.encodeStateAsUpdate(this.doc);
+    this.lastEncodeMs = Date.now() - encodeStartedAt;
+    this.reportWork("full-encode", this.lastEncodeMs, bytes);
+    return bytes;
+  };
+
+  /** Returns true when the append landed and a fold may be due. */
+  private appendDelta = async (): Promise<boolean> => {
     if (this.updatesAccessDenied) {
-      await this.writeForcedSnapshot(localUpdate);
-      return;
+      await this.writeForcedSnapshot(this.encodeFullState());
+      return false;
     }
+    const encodeStartedAt = Date.now();
     const svAtEncode = Y.encodeStateVector(this.doc);
     const delta = Y.encodeStateAsUpdate(this.doc, this.lastPersistedSV);
+    this.lastEncodeMs = Date.now() - encodeStartedAt;
+    this.reportWork("delta-encode", this.lastEncodeMs, delta);
     if (delta.byteLength <= EMPTY_YJS_UPDATE_MAX_BYTES) {
-      return;
+      return false;
     }
     const kind = contentSizeKind(delta.byteLength, this.maxContentBytes);
     if (kind === "abort") {
-      await this.writeForcedSnapshot(localUpdate);
-      return;
+      await this.writeForcedSnapshot(this.encodeFullState());
+      return false;
     }
     const seq = this.lastSeq + 1;
     let result: { id?: string } | undefined;
@@ -1274,48 +1388,45 @@ export class FireProvider extends ObservableV2<any> {
         result = id ? { id } : undefined;
       } else if (error instanceof EpochMismatchError) {
         this.enterEpochReplace(error.actual);
-        return;
+        return false;
       } else if (isAppendEpochFenceError(error)) {
         const advanced = await this.epochAdvancedOnServer();
         if (advanced !== null) {
           this.enterEpochReplace(advanced);
-          return;
+          return false;
         }
         throw error;
       } else {
         throw error;
       }
     }
-    if (this.epochReplaced) return;
+    if (this.epochReplaced) return false;
     this.lastSeq = seq;
     if (result?.id) this.appliedUpdateIds.add(result.id);
     this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, svAtEncode);
-    return localUpdate;
+    return true;
   };
 
-  private scheduleFold = (localUpdate: Uint8Array) => {
+  private scheduleFold = () => {
     if (this.foldInFlight) {
       this.foldQueued = true;
-      this.pendingFoldLocal = localUpdate;
       return;
     }
     this.foldInFlight = true;
     enqueueTabFold(async () => {
       try {
-        await this.maybeFold(localUpdate);
+        await this.maybeFold();
       } finally {
         this.foldInFlight = false;
         if (this.foldQueued) {
           this.foldQueued = false;
-          const next = this.pendingFoldLocal ?? Y.encodeStateAsUpdate(this.doc);
-          this.pendingFoldLocal = undefined;
-          this.scheduleFold(next);
+          this.scheduleFold();
         }
       }
     });
   };
 
-  private maybeFold = async (localUpdate: Uint8Array) => {
+  private maybeFold = async () => {
     if (this.epochReplaced || this.hydratedEpoch === undefined) return;
     if (this.shouldSkipFold()) return;
     const bytesThreshold = Math.floor(
@@ -1325,6 +1436,20 @@ export class FireProvider extends ObservableV2<any> {
       this.updateDocCount < this.foldUpdateThreshold &&
       this.updateTotalBytes < bytesThreshold
     ) {
+      return;
+    }
+    // Encode only once a fold is due (DEV-358). The union below contains
+    // every struct of this replica, so on a GC'd doc already over the cap
+    // the union cannot fit either: skip it. On a large registry that union
+    // took 4-5 s of main thread before failing the same way.
+    const localUpdate = this.encodeFullState();
+    if (
+      !this.snapshotStore &&
+      this.doc.gc &&
+      contentSizeKind(localUpdate.byteLength, this.maxContentBytes) === "abort"
+    ) {
+      this.beginFoldBackoff();
+      this.emitCompactRequired(localUpdate.byteLength);
       return;
     }
     try {
@@ -1451,9 +1576,13 @@ export class FireProvider extends ObservableV2<any> {
 
     if (origin !== this.uid) {
       // We will not allow no. 5. to propagate any further
+      // Peers and Firestore pass a string origin (no. 3 and 4).
+      const remote = typeof origin === "string";
 
-      // Apply updates received from no. 1 to 4. -> triggers no. 5
-      Y.applyUpdate(this.doc, update, this.uid); // the third parameter sets the transaction-origin
+      // Apply updates received from no. 1 and 2 -> triggers no. 5. The doc
+      // already holds this update, so this is a no-op; skip it for no. 3
+      // and 4, where it would decode a possibly multi-MB update twice.
+      if (!remote) Y.applyUpdate(this.doc, update, this.uid); // the third parameter sets the transaction-origin
 
       // Convert no. 1 and 2 to uid, because we want these to eventually trigger 'save' to Firestore
       // sendToQueue method will either:
@@ -1464,7 +1593,7 @@ export class FireProvider extends ObservableV2<any> {
         update,
       });
 
-      this.scheduleSaveToLocal();
+      this.scheduleSaveToLocal(remote);
     }
   };
 
@@ -1603,6 +1732,7 @@ export class FireProvider extends ObservableV2<any> {
     epochField,
     saveTimeoutMs,
     snapshotStore,
+    onMainThreadWork,
   }: Parameters) {
     super();
 
@@ -1622,6 +1752,7 @@ export class FireProvider extends ObservableV2<any> {
     if (epochField) this.epochField = epochField;
     if (saveTimeoutMs !== undefined) this.saveTimeoutMs = saveTimeoutMs;
     if (snapshotStore) this.snapshotStore = snapshotStore;
+    if (onMainThreadWork) this.onMainThreadWork = onMainThreadWork;
     this.persistenceMode = persistence ?? "indexeddb";
     this.persistenceAdapter = createPersistenceAdapter(this.persistenceMode);
     this.awareness = new awarenessProtocol.Awareness(this.doc);
