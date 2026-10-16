@@ -2,6 +2,7 @@ import {
   addDoc,
   Bytes,
   collection,
+  deleteField,
   doc,
   Firestore,
   getDoc,
@@ -291,6 +292,14 @@ export async function listUpdates(
   return out;
 }
 
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.byteLength !== b.byteLength) return false;
+  for (let i = 0; i < a.byteLength; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
 function snapshotSvFromShardData(
   data: Record<string, unknown> | undefined,
 ): Uint8Array | undefined {
@@ -503,8 +512,12 @@ async function foldUpdatesWithStore(
   if (storedMeta) {
     remote = await snapshotStore.read(storedMeta);
   }
+  // Inline `content` is a legacy snapshot (the shard predates its store) or
+  // one a replica without the store folded beside it (DEV-353). Merge it.
+  const inline = remoteMeta.content;
   const snapshot = unionYjsBytes([
     remote,
+    inline,
     ...opts.listed.map((u) => u.update),
     opts.localUpdate,
   ]);
@@ -514,6 +527,10 @@ async function foldUpdatesWithStore(
     const snap = await tx.get(ref);
     const data = snap.data() as Record<string, unknown> | undefined;
     assertExpectedShardEpoch(data, opts.expectedEpoch, epochField);
+    // Drop inline bytes only when they are the ones merged above; a
+    // concurrent inline fold stays for the next reader to union.
+    const current = readBytes(data?.content);
+    const dropInline = !!current && !!inline && bytesEqual(current, inline);
     tx.set(
       ref,
       {
@@ -521,6 +538,7 @@ async function foldUpdatesWithStore(
         [SNAPSHOT_SV_FIELD]: Bytes.fromUint8Array(
           Y.encodeStateVectorFromUpdate(snapshot),
         ),
+        ...(dropInline ? { content: deleteField() } : {}),
         updatedAt: serverTimestamp(),
       },
       { merge: true },

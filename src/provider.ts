@@ -734,7 +734,10 @@ export class FireProvider extends ObservableV2<any> {
     if (this.snapshotStore) {
       let stored = snapshotMetaFromFields(meta);
       let defaultBytes: Uint8Array | undefined;
-      if (!stored && this.snapshotStore.readDefault) {
+      // A shard can predate its store (DEV-353: `handle-registry` moved off
+      // inline `content`). With no Storage pointer that inline snapshot is
+      // still authoritative, so skip the conventional-object probe.
+      if (!stored && !meta.content && this.snapshotStore.readDefault) {
         try {
           const fallback = await this.snapshotStore.readDefault({
             epoch: meta.epoch,
@@ -754,7 +757,8 @@ export class FireProvider extends ObservableV2<any> {
         if (hydrateGen !== this.snapshotHydrateGen) return false;
       }
       if (!stored) {
-        // Missing path + no default object: first write.
+        // Missing path + no default object: inline snapshot or first write.
+        this.applyInlineContent(meta, false);
         return hydrateGen === this.snapshotHydrateGen;
       }
       const skipApply =
@@ -762,6 +766,9 @@ export class FireProvider extends ObservableV2<any> {
         stateVectorCovers(this.lastPersistedSV, meta.snapshotSV);
       if (skipApply) {
         this.hasRemoteContent = true;
+        // `snapshotSV` names the Storage snapshot, not inline bytes an older
+        // replica folded beside it: always merge those.
+        this.applyInlineContent(meta, true);
         return hydrateGen === this.snapshotHydrateGen;
       }
       let bytes = defaultBytes;
@@ -784,6 +791,7 @@ export class FireProvider extends ObservableV2<any> {
         this.lastPersistedSV,
         appliedSv,
       );
+      this.applyInlineContent(meta, true);
       if (defaultBytes) {
         void stampSnapshotMeta({
           db: this.db,
@@ -796,22 +804,37 @@ export class FireProvider extends ObservableV2<any> {
       }
       return true;
     }
-    if (meta.content) {
-      this.hasRemoteContent = true;
-      const skipApply =
-        !!meta.snapshotSV &&
-        stateVectorCovers(this.lastPersistedSV, meta.snapshotSV);
-      if (!skipApply) {
-        this.clearFoldBackoff();
-        this.firebaseDataLastUpdatedAt = new Date().getTime();
-        Y.applyUpdate(this.doc, meta.content, "origin:firebase/update");
-        this.lastPersistedSV = mergeStateVectors(
-          this.lastPersistedSV,
-          meta.snapshotSV ?? stateVectorFromUpdate(meta.content),
-        );
-      }
-    }
+    this.applyInlineContent(meta, false);
     return true;
+  };
+
+  /**
+   * Apply the inline `content` snapshot. `besideStore`: the shard also has a
+   * Storage snapshot, so `snapshotSV` describes that one and cannot vouch for
+   * these bytes (a replica without the store folded them there, DEV-353).
+   * Apply them unconditionally: the merge is idempotent, and a state vector
+   * cannot show a delete-only change. The next store fold removes them.
+   */
+  private applyInlineContent = (
+    meta: ReturnType<typeof readSnapshotMeta>,
+    besideStore: boolean,
+  ) => {
+    const content = meta.content;
+    if (!content) return;
+    this.hasRemoteContent = true;
+    const contentSV =
+      besideStore || !meta.snapshotSV
+        ? stateVectorFromUpdate(content)
+        : meta.snapshotSV;
+    const covered =
+      !besideStore &&
+      !!meta.snapshotSV &&
+      stateVectorCovers(this.lastPersistedSV, meta.snapshotSV);
+    if (covered) return;
+    this.clearFoldBackoff();
+    this.firebaseDataLastUpdatedAt = new Date().getTime();
+    Y.applyUpdate(this.doc, content, "origin:firebase/update");
+    this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, contentSV);
   };
 
   trackMesh = () => {
