@@ -621,8 +621,12 @@ export class FireProvider extends ObservableV2 {
                 let defaultBytes;
                 // A shard can predate its store (DEV-353: `handle-registry` moved off
                 // inline `content`). With no Storage pointer that inline snapshot is
-                // still authoritative, so skip the conventional-object probe.
-                if (!stored && !meta.content && this.snapshotStore.readDefault) {
+                // still authoritative, so skip the conventional-object probe. Stores
+                // that never had inline content ignore the field, as before.
+                const inlineMeta = this.snapshotStore.inlineContent === "merge"
+                    ? meta
+                    : Object.assign(Object.assign({}, meta), { content: undefined });
+                if (!stored && !inlineMeta.content && this.snapshotStore.readDefault) {
                     try {
                         const fallback = yield this.snapshotStore.readDefault({
                             epoch: meta.epoch,
@@ -643,7 +647,7 @@ export class FireProvider extends ObservableV2 {
                 }
                 if (!stored) {
                     // Missing path + no default object: inline snapshot or first write.
-                    this.applyInlineContent(meta, false);
+                    this.applyInlineContent(inlineMeta, false);
                     return hydrateGen === this.snapshotHydrateGen;
                 }
                 const skipApply = !!meta.snapshotSV &&
@@ -652,7 +656,7 @@ export class FireProvider extends ObservableV2 {
                     this.hasRemoteContent = true;
                     // `snapshotSV` names the Storage snapshot, not inline bytes an older
                     // replica folded beside it: always merge those.
-                    this.applyInlineContent(meta, true);
+                    this.applyInlineContent(inlineMeta, true);
                     return hydrateGen === this.snapshotHydrateGen;
                 }
                 let bytes = defaultBytes;
@@ -674,7 +678,7 @@ export class FireProvider extends ObservableV2 {
                 Y.applyUpdate(this.doc, bytes, "origin:firebase/update");
                 const appliedSv = (_d = meta.snapshotSV) !== null && _d !== void 0 ? _d : stateVectorFromUpdate(bytes);
                 this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, appliedSv);
-                this.applyInlineContent(meta, true);
+                this.applyInlineContent(inlineMeta, true);
                 if (defaultBytes) {
                     void stampSnapshotMeta({
                         db: this.db,

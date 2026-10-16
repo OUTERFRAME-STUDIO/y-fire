@@ -28,6 +28,7 @@ import {
   CONTENT_STORAGE_GENERATION_FIELD,
   CONTENT_STORAGE_PATH_FIELD,
   SNAPSHOT_BACKEND_FIELD,
+  SnapshotPointerChangedError,
   foldUpdates,
   readSnapshotMeta,
   type SnapshotStore,
@@ -40,6 +41,7 @@ const LARGE_PAYLOAD_CHARS = Math.floor(FIRESTORE_CONTENT_MAX_BYTES * 1.5);
 
 function createMemorySnapshotStore(opts?: {
   defaultPath?: string;
+  inlineContent?: SnapshotStore["inlineContent"];
 }): {
   blobs: Map<string, Uint8Array>;
   store: SnapshotStore;
@@ -77,7 +79,9 @@ function createMemorySnapshotStore(opts?: {
     }
     return null;
   });
-  return { blobs, store: { write, read, readDefault }, write, read, readDefault };
+  const store: SnapshotStore = { write, read, readDefault };
+  if (opts?.inlineContent) store.inlineContent = opts.inlineContent;
+  return { blobs, store, write, read, readDefault };
 }
 
 function shardHasContentField(data: Record<string, unknown> | undefined) {
@@ -546,6 +550,7 @@ describe("snapshotStore over a legacy inline snapshot (DEV-353)", () => {
   it("hydrates inline content plus updates/* without probing the store", async () => {
     const { store, readDefault, read } = createMemorySnapshotStore({
       defaultPath: "snap/0",
+      inlineContent: "merge",
     });
     const base = new Y.Doc();
     base.getText("t").insert(0, "inline");
@@ -571,7 +576,7 @@ describe("snapshotStore over a legacy inline snapshot (DEV-353)", () => {
   });
 
   it("does not first-write over inline content", async () => {
-    const { store, write } = createMemorySnapshotStore();
+    const { store, write } = createMemorySnapshotStore({ inlineContent: "merge" });
     const { bytes, sv } = inlineShard("inline");
     seedFirestoreShard(TEST_PATH, bytes, { snapshotSV: sv });
 
@@ -591,7 +596,7 @@ describe("snapshotStore over a legacy inline snapshot (DEV-353)", () => {
   });
 
   it("merges inline content that sits beside a Storage snapshot", async () => {
-    const { store } = createMemorySnapshotStore();
+    const { store } = createMemorySnapshotStore({ inlineContent: "merge" });
     const stored = new Y.Doc();
     stored.getMap("m").set("fromStore", 1);
     const meta = await store.write(Y.encodeStateAsUpdate(stored));
@@ -617,8 +622,33 @@ describe("snapshotStore over a legacy inline snapshot (DEV-353)", () => {
     older.destroy();
   });
 
+  it("ignores inline content when the store does not opt in", async () => {
+    const { store } = createMemorySnapshotStore();
+    const stored = new Y.Doc();
+    stored.getMap("m").set("fromStore", 1);
+    const meta = await store.write(Y.encodeStateAsUpdate(stored));
+    const stray = new Y.Doc();
+    stray.getMap("m").set("fromInline", 2);
+    seedStorageShard(TEST_PATH, meta, {
+      snapshotSV: Y.encodeStateVector(stored),
+    });
+    seedFirestoreContent(TEST_PATH, Y.encodeStateAsUpdate(stray));
+
+    const created = await createTestProvider({ snapshotStore: store }, { reset: false });
+    provider = created.provider;
+    emitServerStorageSnapshot(TEST_PATH);
+    await waitUntil(
+      () => created.ydoc.getMap("m").size > 0,
+      "store hydrate",
+    );
+    await flushMicrotasks();
+    expect(created.ydoc.getMap("m").toJSON()).toEqual({ fromStore: 1 });
+    stored.destroy();
+    stray.destroy();
+  });
+
   it("first fold moves inline content into the store and drops the field", async () => {
-    const { store, write, blobs } = createMemorySnapshotStore();
+    const { store, write, blobs } = createMemorySnapshotStore({ inlineContent: "merge" });
     const { bytes, sv } = inlineShard("inline");
     seedFirestoreShard(TEST_PATH, bytes, { snapshotSV: sv });
 
@@ -662,7 +692,7 @@ describe("foldUpdates with a store over inline content (DEV-353)", () => {
   });
 
   it("unions inline content even when the local replica lacks it", async () => {
-    const { store, blobs } = createMemorySnapshotStore();
+    const { store, blobs } = createMemorySnapshotStore({ inlineContent: "merge" });
     const remote = new Y.Doc();
     remote.getMap("m").set("inline", true);
     seedFirestoreShard(TEST_PATH, Y.encodeStateAsUpdate(remote));
@@ -690,8 +720,118 @@ describe("foldUpdates with a store over inline content (DEV-353)", () => {
     folded.destroy();
   });
 
+  it("leaves inline content alone when the store does not opt in", async () => {
+    const { store, blobs } = createMemorySnapshotStore();
+    const stray = new Y.Doc();
+    stray.getMap("m").set("stray", true);
+    seedFirestoreShard(TEST_PATH, Y.encodeStateAsUpdate(stray));
+    const local = new Y.Doc();
+    local.getMap("m").set("local", true);
+
+    const fold = await foldUpdates({
+      db: {} as never,
+      documentPath: TEST_PATH,
+      listed: [],
+      localUpdate: Y.encodeStateAsUpdate(local),
+      documentMapper: (bytes) => ({ content: bytes }),
+      maxContentBytes: FIRESTORE_CONTENT_MAX_BYTES,
+      force: true,
+      snapshotStore: store,
+      expectedEpoch: 0,
+    });
+    expect(fold.status).toBe("ok");
+    const folded = new Y.Doc();
+    Y.applyUpdate(folded, blobs.get("snap/1")!);
+    expect(folded.getMap("m").toJSON()).toEqual({ local: true });
+    expect(shardHasContentField(firestoreDocs.get(TEST_PATH))).toBe(true);
+    stray.destroy();
+    local.destroy();
+    folded.destroy();
+  });
+
+  it("does not commit or delete updates when another fold moved the pointer", async () => {
+    const { store } = createMemorySnapshotStore({ inlineContent: "merge" });
+    const base = new Y.Doc();
+    base.getMap("m").set("a", 1);
+    seedFirestoreShard(TEST_PATH, Y.encodeStateAsUpdate(base));
+    const wal = new Y.Doc();
+    wal.getMap("m").set("w", 1);
+    const walBytes = Y.encodeStateAsUpdate(wal);
+    seedFirestoreUpdate(TEST_PATH, "u1", walBytes);
+    let calls = 0;
+    setRunTransactionBefore(async () => {
+      calls++;
+      // The server's first fold commits its own object between our read and
+      // our commit.
+      if (calls === 2) {
+        const existing = firestoreDocs.get(TEST_PATH) ?? {};
+        firestoreDocs.set(TEST_PATH, {
+          ...existing,
+          [SNAPSHOT_BACKEND_FIELD]: "storage",
+          [CONTENT_STORAGE_PATH_FIELD]: "server/1",
+          [CONTENT_STORAGE_GENERATION_FIELD]: "77",
+        });
+      }
+    });
+    try {
+      await expect(
+        foldUpdates({
+          db: {} as never,
+          documentPath: TEST_PATH,
+          listed: [{ id: "u1", update: walBytes, seq: 1 }],
+          localUpdate: new Uint8Array([0, 0]),
+          documentMapper: (bytes) => ({ content: bytes }),
+          maxContentBytes: FIRESTORE_CONTENT_MAX_BYTES,
+          force: true,
+          snapshotStore: store,
+          expectedEpoch: 0,
+        }),
+      ).rejects.toBeInstanceOf(SnapshotPointerChangedError);
+    } finally {
+      setRunTransactionBefore(async () => {});
+    }
+    const saved = firestoreDocs.get(TEST_PATH);
+    expect(saved?.[CONTENT_STORAGE_PATH_FIELD]).toBe("server/1");
+    expect(firestoreCollections.get(updatesPath(TEST_PATH))?.has("u1")).toBe(true);
+    base.destroy();
+    wal.destroy();
+  });
+
+  it("unions an object left at the target without a pointer", async () => {
+    const { store, blobs, readDefault } = createMemorySnapshotStore({
+      inlineContent: "merge",
+    });
+    const orphan = new Y.Doc();
+    orphan.getMap("m").set("orphan", true);
+    blobs.set("snap/3", Y.encodeStateAsUpdate(orphan));
+    const inline = new Y.Doc();
+    inline.getMap("m").set("inline", true);
+    seedFirestoreShard(TEST_PATH, Y.encodeStateAsUpdate(inline), { epoch: 3 });
+
+    const fold = await foldUpdates({
+      db: {} as never,
+      documentPath: TEST_PATH,
+      listed: [],
+      localUpdate: new Uint8Array([0, 0]),
+      documentMapper: (bytes) => ({ content: bytes }),
+      maxContentBytes: FIRESTORE_CONTENT_MAX_BYTES,
+      force: true,
+      snapshotStore: store,
+      expectedEpoch: 3,
+    });
+    expect(fold.status).toBe("ok");
+    expect(readDefault.mock.calls[0]?.[0]).toMatchObject({ epoch: 3 });
+    const path = firestoreDocs.get(TEST_PATH)?.[CONTENT_STORAGE_PATH_FIELD] as string;
+    const folded = new Y.Doc();
+    Y.applyUpdate(folded, blobs.get(path)!);
+    expect(folded.getMap("m").toJSON()).toEqual({ orphan: true, inline: true });
+    orphan.destroy();
+    inline.destroy();
+    folded.destroy();
+  });
+
   it("keeps inline content that changed after it was read", async () => {
-    const { store } = createMemorySnapshotStore();
+    const { store } = createMemorySnapshotStore({ inlineContent: "merge" });
     const first = new Y.Doc();
     first.getMap("m").set("a", 1);
     seedFirestoreShard(TEST_PATH, Y.encodeStateAsUpdate(first));

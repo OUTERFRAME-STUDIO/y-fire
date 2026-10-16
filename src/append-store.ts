@@ -46,7 +46,22 @@ export type SnapshotStore = {
   readDefault?(opts?: {
     epoch?: number | null;
   }): Promise<{ bytes: Uint8Array; meta: SnapshotMeta } | null>;
+  /**
+   * `"merge"`: the shard can still carry an inline `content` snapshot from
+   * before it had this store (DEV-353). Hydrate applies it, and a fold unions
+   * it, drops the field, and commits only if the Storage pointer is the one it
+   * read. Unset: inline `content` is ignored (stores that never had it).
+   */
+  inlineContent?: "merge";
 };
+
+/** Another writer moved the Storage pointer while this fold ran. */
+export class SnapshotPointerChangedError extends Error {
+  constructor(documentPath: string) {
+    super(`y-fire: snapshot pointer changed during fold (${documentPath})`);
+    this.name = "SnapshotPointerChangedError";
+  }
+}
 
 export type WriteSnapshotResult = {
   outcome: "written" | "exists";
@@ -509,12 +524,18 @@ async function foldUpdatesWithStore(
   });
   let remote: Uint8Array | undefined;
   const storedMeta = snapshotMetaFromFields(remoteMeta);
+  const mergeInline = snapshotStore.inlineContent === "merge";
   if (storedMeta) {
     remote = await snapshotStore.read(storedMeta);
+  } else if (mergeInline && snapshotStore.readDefault) {
+    // First move off inline `content`: union an object another writer left at
+    // the target without committing a pointer, instead of failing on it.
+    remote = (await snapshotStore.readDefault({ epoch: remoteMeta.epoch }))
+      ?.bytes;
   }
   // Inline `content` is a legacy snapshot (the shard predates its store) or
   // one a replica without the store folded beside it (DEV-353). Merge it.
-  const inline = remoteMeta.content;
+  const inline = mergeInline ? remoteMeta.content : undefined;
   const snapshot = unionYjsBytes([
     remote,
     inline,
@@ -527,6 +548,18 @@ async function foldUpdatesWithStore(
     const snap = await tx.get(ref);
     const data = snap.data() as Record<string, unknown> | undefined;
     assertExpectedShardEpoch(data, opts.expectedEpoch, epochField);
+    if (mergeInline) {
+      // Two first folds (this client and the server, or two tabs) can write
+      // different objects; the later commit must not drop updates the other
+      // folded and deleted. Retry from the new pointer instead.
+      const now = readSnapshotMeta(data, epochField);
+      if (
+        now.contentStoragePath !== remoteMeta.contentStoragePath ||
+        now.contentStorageGeneration !== remoteMeta.contentStorageGeneration
+      ) {
+        throw new SnapshotPointerChangedError(opts.documentPath);
+      }
+    }
     // Drop inline bytes only when they are the ones merged above; a
     // concurrent inline fold stays for the next reader to union.
     const current = readBytes(data?.content);
