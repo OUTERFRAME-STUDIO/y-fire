@@ -7,6 +7,8 @@ export type {
   EpochReplaceEvent,
   SnapshotMeta,
   SnapshotStore,
+  MainThreadWorkEvent,
+  MainThreadWorkPhase,
 } from "./provider";
 export type { PersistenceMode } from "./persistence";
 export {

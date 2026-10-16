@@ -25,6 +25,22 @@ export interface EpochReplaceEvent {
     from: number;
     to: number;
 }
+/** Synchronous main-thread work the provider does on a shard. */
+export type MainThreadWorkPhase = 
+/** Full-doc encode for the IndexedDB copy. */
+"local-encode"
+/** Full-doc encode for a snapshot write or a fold. */
+ | "full-encode"
+/** Delta encode for an `updates/*` append. */
+ | "delta-encode"
+/** Applying Firestore bytes, including the doc's observers. */
+ | "remote-apply";
+export interface MainThreadWorkEvent {
+    documentPath: string;
+    phase: MainThreadWorkPhase;
+    ms: number;
+    bytes: number;
+}
 export interface Parameters {
     firebaseApp: FirebaseApp;
     ydoc: Y.Doc;
@@ -55,6 +71,11 @@ export interface Parameters {
      * the shard doc holds metadata only. WAL `updates/*` is unchanged.
      */
     snapshotStore?: SnapshotStore;
+    /**
+     * Called after each encode or remote apply with its duration, so a host
+     * can log the work that blocks the main thread on large shards.
+     */
+    onMainThreadWork?: (event: MainThreadWorkEvent) => void;
 }
 interface PeersRTC {
     receivers: {
@@ -66,6 +87,14 @@ interface PeersRTC {
 }
 /** Trailing debounce for full-doc IndexedDB encodes after local updates. */
 export declare const LOCAL_PERSIST_DEBOUNCE_MS = 500;
+/**
+ * Delay before caching remote (Firestore / peer) updates in IndexedDB. The
+ * server already holds them, so the local copy only warms the next open;
+ * each save is a full-doc encode on the main thread, which on a multi-MB
+ * shard costs hundreds of ms per remote update (DEV-358). A local edit or a
+ * hide / kill flush still saves them sooner.
+ */
+export declare const REMOTE_LOCAL_PERSIST_DELAY_MS = 10000;
 /**
  * FireProvider class that handles firestore data sync and awareness
  * based on webRTC.
@@ -107,6 +136,8 @@ export declare class FireProvider extends ObservableV2<any> {
     saveWriteStartedAt?: number;
     lastLocalFlushMs: number | null;
     lastEncodeMs: number | null;
+    lastLocalEncodeMs: number | null;
+    onMainThreadWork?: (event: MainThreadWorkEvent) => void;
     lastSaveDurationMs: number | null;
     private saveQueued;
     firebaseDataLastUpdatedAt: number;
@@ -123,6 +154,11 @@ export declare class FireProvider extends ObservableV2<any> {
     private meshRetryTimeout?;
     private saveRetryTimeout?;
     private localPersistTimeout?;
+    private localPersistDueAt?;
+    /** Doc content not yet written to IndexedDB. */
+    private localSaveDirty;
+    /** A local edit (not a remote update) is among the unsaved content. */
+    private localEditUnsaved;
     private dataListenerPaused;
     private pendingSyncLocal;
     private lastPersistedSV?;
@@ -144,7 +180,6 @@ export declare class FireProvider extends ObservableV2<any> {
     private listedUpdates;
     private foldInFlight;
     private foldQueued;
-    private pendingFoldLocal?;
     private foldBackoffUntil?;
     private foldAbortedAtSnapshotSV?;
     private foldAbortReported;
@@ -166,14 +201,29 @@ export declare class FireProvider extends ObservableV2<any> {
     init: () => Promise<void>;
     syncLocal: () => Promise<void>;
     saveToLocal: () => Promise<void>;
+    private clearLocalPersistTimer;
+    /**
+     * Local edits keep the trailing {@link LOCAL_PERSIST_DEBOUNCE_MS}
+     * debounce. Remote updates wait {@link REMOTE_LOCAL_PERSIST_DELAY_MS} and
+     * never push back a save that is already due sooner.
+     */
     private scheduleSaveToLocal;
-    flushSaveToLocal: () => Promise<void>;
+    /**
+     * Write unsaved content to IndexedDB now. A no-op when nothing changed
+     * since the last local save: every Firestore save flushes first, and a
+     * second full-doc encode of an unchanged doc is pure main-thread cost
+     * (DEV-358). `localEditsOnly` skips content that is only remote updates.
+     */
+    flushSaveToLocal: (options?: {
+        localEditsOnly?: boolean;
+    }) => Promise<void>;
     deleteLocal: () => Promise<void>;
     initiateHandler: () => void;
     private scheduleSnapshotRetry;
     private scheduleHydrateRetry;
     private scheduleMeshRetry;
     private maybeBecomeServerReady;
+    private reportWork;
     private applyRemoteUpdateBytes;
     private enterEpochReplace;
     /**
@@ -232,6 +282,9 @@ export declare class FireProvider extends ObservableV2<any> {
     private applyFoldSuccess;
     private writeForcedSnapshot;
     private writeFirstSnapshot;
+    /** Full-state encode, timed into {@link lastEncodeMs}. */
+    private encodeFullState;
+    /** Returns true when the append landed and a fold may be due. */
     private appendDelta;
     private scheduleFold;
     private maybeFold;
@@ -253,6 +306,6 @@ export declare class FireProvider extends ObservableV2<any> {
     consoleHandler: (message: any, data?: any) => void;
     destroy: () => void;
     kill(keepReadOnly?: boolean): Promise<void>;
-    constructor({ firebaseApp, ydoc, path, docMapper, maxUpdatesThreshold, maxWaitTime, maxWaitFirestoreTime, maxFirestoreDeferral, persistence, maxContentBytes, foldUpdateThreshold, foldBytesFraction, epochField, saveTimeoutMs, snapshotStore, }: Parameters);
+    constructor({ firebaseApp, ydoc, path, docMapper, maxUpdatesThreshold, maxWaitTime, maxWaitFirestoreTime, maxFirestoreDeferral, persistence, maxContentBytes, foldUpdateThreshold, foldBytesFraction, epochField, saveTimeoutMs, snapshotStore, onMainThreadWork, }: Parameters);
 }
 //# sourceMappingURL=provider.d.ts.map
