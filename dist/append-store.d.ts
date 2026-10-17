@@ -33,7 +33,18 @@ export type SnapshotStore = {
         bytes: Uint8Array;
         meta: SnapshotMeta;
     } | null>;
+    /**
+     * `"merge"`: the shard can still carry an inline `content` snapshot from
+     * before it had this store (DEV-353). Hydrate applies it, and a fold unions
+     * it, drops the field, and commits only if the Storage pointer is the one it
+     * read. Unset: inline `content` is ignored (stores that never had it).
+     */
+    inlineContent?: "merge";
 };
+/** Another writer moved the Storage pointer while this fold ran. */
+export declare class SnapshotPointerChangedError extends Error {
+    constructor(documentPath: string);
+}
 export type WriteSnapshotResult = {
     outcome: "written" | "exists";
     snapshotSV?: Uint8Array;

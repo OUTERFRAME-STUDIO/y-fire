@@ -7,7 +7,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
         step((generator = generator.apply(thisArg, _arguments || [])).next());
     });
 };
-import { addDoc, Bytes, collection, doc, getDoc, getDocs, runTransaction, serverTimestamp, } from "@firebase/firestore";
+import { addDoc, Bytes, collection, deleteField, doc, getDoc, getDocs, runTransaction, serverTimestamp, } from "@firebase/firestore";
 import * as Y from "yjs";
 import { contentSizeKind } from "./firestore-limits";
 export const UPDATES_SUBCOLLECTION = "updates";
@@ -21,6 +21,13 @@ export const CONTENT_RAW_BYTES_FIELD = "contentRawBytes";
 export const SNAPSHOT_BACKEND_STORAGE = "storage";
 export const DEFAULT_FOLD_UPDATE_THRESHOLD = 20;
 export const DEFAULT_FOLD_BYTES_FRACTION = 0.5;
+/** Another writer moved the Storage pointer while this fold ran. */
+export class SnapshotPointerChangedError extends Error {
+    constructor(documentPath) {
+        super(`y-fire: snapshot pointer changed during fold (${documentPath})`);
+        this.name = "SnapshotPointerChangedError";
+    }
+}
 export function updatesCollectionPath(documentPath) {
     return `${documentPath}/${UPDATES_SUBCOLLECTION}`;
 }
@@ -185,6 +192,15 @@ export function listUpdates(db, documentPath, epochField = DEFAULT_EPOCH_FIELD) 
         return out;
     });
 }
+function bytesEqual(a, b) {
+    if (a.byteLength !== b.byteLength)
+        return false;
+    for (let i = 0; i < a.byteLength; i++) {
+        if (a[i] !== b[i])
+            return false;
+    }
+    return true;
+}
 function snapshotSvFromShardData(data) {
     return readBytes(data === null || data === void 0 ? void 0 : data[SNAPSHOT_SV_FIELD]);
 }
@@ -303,6 +319,7 @@ export function foldUpdates(opts) {
     });
 }
 function foldUpdatesWithStore(opts, ref, snapshotStore, epochField) {
+    var _a;
     return __awaiter(this, void 0, void 0, function* () {
         let remoteMeta = readSnapshotMeta(undefined);
         yield runTransaction(opts.db, (tx) => __awaiter(this, void 0, void 0, function* () {
@@ -313,11 +330,21 @@ function foldUpdatesWithStore(opts, ref, snapshotStore, epochField) {
         }));
         let remote;
         const storedMeta = snapshotMetaFromFields(remoteMeta);
+        const mergeInline = snapshotStore.inlineContent === "merge";
         if (storedMeta) {
             remote = yield snapshotStore.read(storedMeta);
         }
+        else if (mergeInline && snapshotStore.readDefault) {
+            // First move off inline `content`: union an object another writer left at
+            // the target without committing a pointer, instead of failing on it.
+            remote = (_a = (yield snapshotStore.readDefault({ epoch: remoteMeta.epoch }))) === null || _a === void 0 ? void 0 : _a.bytes;
+        }
+        // Inline `content` is a legacy snapshot (the shard predates its store) or
+        // one a replica without the store folded beside it (DEV-353). Merge it.
+        const inline = mergeInline ? remoteMeta.content : undefined;
         const snapshot = unionYjsBytes([
             remote,
+            inline,
             ...opts.listed.map((u) => u.update),
             opts.localUpdate,
         ]);
@@ -327,7 +354,21 @@ function foldUpdatesWithStore(opts, ref, snapshotStore, epochField) {
             const snap = yield tx.get(ref);
             const data = snap.data();
             assertExpectedShardEpoch(data, opts.expectedEpoch, epochField);
-            tx.set(ref, Object.assign(Object.assign({}, snapshotStoreDocFields(written)), { [SNAPSHOT_SV_FIELD]: Bytes.fromUint8Array(Y.encodeStateVectorFromUpdate(snapshot)), updatedAt: serverTimestamp() }), { merge: true });
+            if (mergeInline) {
+                // Two first folds (this client and the server, or two tabs) can write
+                // different objects; the later commit must not drop updates the other
+                // folded and deleted. Retry from the new pointer instead.
+                const now = readSnapshotMeta(data, epochField);
+                if (now.contentStoragePath !== remoteMeta.contentStoragePath ||
+                    now.contentStorageGeneration !== remoteMeta.contentStorageGeneration) {
+                    throw new SnapshotPointerChangedError(opts.documentPath);
+                }
+            }
+            // Drop inline bytes only when they are the ones merged above; a
+            // concurrent inline fold stays for the next reader to union.
+            const current = readBytes(data === null || data === void 0 ? void 0 : data.content);
+            const dropInline = !!current && !!inline && bytesEqual(current, inline);
+            tx.set(ref, Object.assign(Object.assign(Object.assign(Object.assign({}, snapshotStoreDocFields(written)), { [SNAPSHOT_SV_FIELD]: Bytes.fromUint8Array(Y.encodeStateVectorFromUpdate(snapshot)) }), (dropInline ? { content: deleteField() } : {})), { updatedAt: serverTimestamp() }), { merge: true });
             for (const update of opts.listed) {
                 tx.delete(doc(opts.db, `${updatesCollectionPath(opts.documentPath)}/${update.id}`));
             }

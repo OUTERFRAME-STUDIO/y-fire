@@ -307,6 +307,22 @@ export const onSnapshot = vi.fn(
   },
 );
 
+const DELETE_FIELD = { __deleteField: true };
+
+/** Mirrors `deleteField()`: merge writes drop the field. */
+export const deleteField = vi.fn(() => DELETE_FIELD);
+
+function mergeFields(
+  existing: Record<string, unknown>,
+  incoming: Record<string, unknown>,
+): Record<string, unknown> {
+  const merged = { ...existing, ...incoming };
+  for (const [key, value] of Object.entries(incoming)) {
+    if (value === DELETE_FIELD) delete merged[key];
+  }
+  return merged;
+}
+
 export const setDoc = vi.fn(async (ref: MockRef, data: unknown, options?: unknown) => {
   assertNoUndefinedFields(data);
   setDocCalls.push({ ref, data, options });
@@ -315,7 +331,7 @@ export const setDoc = vi.fn(async (ref: MockRef, data: unknown, options?: unknow
   firestoreDocs.set(
     ref.path,
     options && typeof options === "object" && (options as { merge?: boolean }).merge
-      ? { ...existing, ...incoming }
+      ? mergeFields(existing, incoming)
       : incoming,
   );
   await setDocImpl();
@@ -409,7 +425,7 @@ export const runTransaction = vi.fn(
         const incoming = (data ?? {}) as Record<string, unknown>;
         firestoreDocs.set(
           ref.path,
-          options?.merge ? { ...existing, ...incoming } : incoming,
+          options?.merge ? mergeFields(existing, incoming) : incoming,
         );
       },
       delete: (ref) => {

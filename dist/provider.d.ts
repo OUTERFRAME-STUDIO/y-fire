@@ -248,6 +248,14 @@ export declare class FireProvider extends ObservableV2<any> {
      * (retry scheduled) or a newer snapshot superseded this one.
      */
     private applyRemoteSnapshot;
+    /**
+     * Apply the inline `content` snapshot. `besideStore`: the shard also has a
+     * Storage snapshot, so `snapshotSV` describes that one and cannot vouch for
+     * these bytes (a replica without the store folded them there, DEV-353).
+     * Apply them unconditionally: the merge is idempotent, and a state vector
+     * cannot show a delete-only change. The next store fold removes them.
+     */
+    private applyInlineContent;
     trackMesh: () => void;
     reconnect: () => void;
     trackConnections: () => Promise<void>;
