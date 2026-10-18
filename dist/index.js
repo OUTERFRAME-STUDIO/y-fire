@@ -1,3 +1,4 @@
 export { FireProvider } from "./provider";
 export { FIRESTORE_CONTENT_MAX_BYTES, FIRESTORE_CONTENT_WARN_BYTES, contentSizeKind, } from "./firestore-limits";
 export { EpochMismatchError, SnapshotPointerChangedError, updateEpochMatches, } from "./append-store";
+export { addDeleteRanges, encodeDeltaWithDeleteRanges, subtractDeleteRanges, } from "./delete-set";

@@ -162,6 +162,12 @@ export declare class FireProvider extends ObservableV2<any> {
     private dataListenerPaused;
     private pendingSyncLocal;
     private lastPersistedSV?;
+    /**
+     * Deletions made outside a Firestore apply (local edits, peers, IndexedDB)
+     * that no successful write has carried yet. Appends ship these instead of
+     * the doc's whole delete set (DEV-356).
+     */
+    private unpersistedDeletes;
     private lastSnapshotFromCache;
     private hasRemoteContent;
     private hydratedEpoch?;
@@ -302,6 +308,11 @@ export declare class FireProvider extends ObservableV2<any> {
         from: unknown;
         update: Uint8Array;
     }) => void;
+    private trackDeletes;
+    /** Copy of {@link unpersistedDeletes}, taken when a write encodes the doc. */
+    private snapshotUnpersistedDeletes;
+    /** A write carrying `sent` landed: those deletions are persisted. */
+    private markDeletesPersisted;
     updateHandler: (update: Uint8Array, origin: any) => void;
     awarenessUpdateHandler: ({ added, updated, removed, }: {
         added: number[];
