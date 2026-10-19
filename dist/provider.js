@@ -19,6 +19,9 @@ import { EMPTY_YJS_UPDATE_MAX_BYTES, FIRESTORE_CONTENT_MAX_BYTES, contentSizeKin
 import { appendUpdate, DEFAULT_EPOCH_FIELD, DEFAULT_FOLD_BYTES_FRACTION, DEFAULT_FOLD_UPDATE_THRESHOLD, EpochMismatchError, foldUpdates, isAlreadyExistsError, listUpdates, readBytes, readSnapshotMeta, snapshotMetaFromFields, updateEpochMatches, updateIdFromAlreadyExistsError, updatesCollectionPath, writeSnapshot, stampSnapshotMeta, } from "./append-store";
 import { enqueueTabFold } from "./fold-scheduler";
 import { mergeStateVectors, stateVectorCovers, stateVectorFromUpdate } from "./state-vector";
+import { addDeleteRanges, encodeDeltaWithDeleteRanges, subtractDeleteRanges, } from "./delete-set";
+/** Transaction origin for content read from Firestore (or already persisted). */
+const FIREBASE_UPDATE_ORIGIN = "origin:firebase/update";
 /** Default budget for `appendUpdate` / first-snapshot Firestore writes. */
 export const DEFAULT_SAVE_TIMEOUT_MS = 15000;
 const SNAPSHOT_BACKOFF_BASE_MS = 500;
@@ -184,6 +187,7 @@ export class FireProvider extends ObservableV2 {
             if (this.localPersistTimeout)
                 clearTimeout(this.localPersistTimeout);
             this.doc.off("update", this.updateHandler);
+            this.doc.off("afterTransaction", this.trackDeletes);
             this.awareness.off("update", this.awarenessUpdateHandler);
             deleteInstance(this.db, this.documentPath, this.uid);
             if (this.unsubscribeData && !keepReadOnly) {
@@ -246,6 +250,12 @@ export class FireProvider extends ObservableV2 {
         this.localEditUnsaved = false;
         this.dataListenerPaused = false;
         this.pendingSyncLocal = false;
+        /**
+         * Deletions made outside a Firestore apply (local edits, peers, IndexedDB)
+         * that no successful write has carried yet. Appends ship these instead of
+         * the doc's whole delete set (DEV-356).
+         */
+        this.unpersistedDeletes = new Map();
         this.lastSnapshotFromCache = true;
         this.hasRemoteContent = false;
         this.epochReplaced = false;
@@ -465,7 +475,7 @@ export class FireProvider extends ObservableV2 {
         this.applyRemoteUpdateBytes = (bytes) => {
             this.firebaseDataLastUpdatedAt = new Date().getTime();
             const applyStartedAt = Date.now();
-            Y.applyUpdate(this.doc, bytes, "origin:firebase/update");
+            Y.applyUpdate(this.doc, bytes, FIREBASE_UPDATE_ORIGIN);
             this.reportWork("remote-apply", Date.now() - applyStartedAt, bytes);
             this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, stateVectorFromUpdate(bytes));
         };
@@ -675,7 +685,7 @@ export class FireProvider extends ObservableV2 {
                 this.hasRemoteContent = true;
                 this.clearFoldBackoff();
                 this.firebaseDataLastUpdatedAt = new Date().getTime();
-                Y.applyUpdate(this.doc, bytes, "origin:firebase/update");
+                Y.applyUpdate(this.doc, bytes, FIREBASE_UPDATE_ORIGIN);
                 const appliedSv = (_d = meta.snapshotSV) !== null && _d !== void 0 ? _d : stateVectorFromUpdate(bytes);
                 this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, appliedSv);
                 this.applyInlineContent(inlineMeta, true);
@@ -716,7 +726,7 @@ export class FireProvider extends ObservableV2 {
                 return;
             this.clearFoldBackoff();
             this.firebaseDataLastUpdatedAt = new Date().getTime();
-            Y.applyUpdate(this.doc, content, "origin:firebase/update");
+            Y.applyUpdate(this.doc, content, FIREBASE_UPDATE_ORIGIN);
             this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, contentSV);
         };
         this.trackMesh = () => {
@@ -888,7 +898,7 @@ export class FireProvider extends ObservableV2 {
         this.adoptPersistedSnapshot = (bytes) => {
             if (bytes.byteLength <= EMPTY_YJS_UPDATE_MAX_BYTES)
                 return;
-            Y.applyUpdate(this.doc, bytes, "origin:firebase/update");
+            Y.applyUpdate(this.doc, bytes, FIREBASE_UPDATE_ORIGIN);
             this.hasRemoteContent = true;
             this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, stateVectorFromUpdate(bytes));
         };
@@ -1028,7 +1038,7 @@ export class FireProvider extends ObservableV2 {
             if (fold.kind === "warn" && this.onSaveWarning) {
                 this.onSaveWarning(this.saveContext(fold.byteLength, "size-warn"));
             }
-            Y.applyUpdate(this.doc, fold.snapshot, "origin:firebase/update");
+            Y.applyUpdate(this.doc, fold.snapshot, FIREBASE_UPDATE_ORIGIN);
             // Persist the written snapshot's SV, not the live doc: concurrent local
             // edits during the fold await must remain unpersisted for the next append.
             this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, stateVectorFromUpdate(fold.snapshot));
@@ -1042,6 +1052,8 @@ export class FireProvider extends ObservableV2 {
             this.clearFoldBackoff();
         };
         this.writeForcedSnapshot = (localUpdate) => __awaiter(this, void 0, void 0, function* () {
+            // Callers encode `localUpdate` synchronously just before this call.
+            const sentDeletes = this.snapshotUnpersistedDeletes();
             const listed = this.updatesAccessDenied
                 ? []
                 : this.listedUpdates.length > 0
@@ -1067,9 +1079,11 @@ export class FireProvider extends ObservableV2 {
             if (fold.status !== "ok")
                 return;
             this.applyFoldSuccess(fold, listed);
+            this.markDeletesPersisted(sentDeletes);
         });
         this.writeFirstSnapshot = (localUpdate) => __awaiter(this, void 0, void 0, function* () {
             const svAtEncode = Y.encodeStateVector(this.doc);
+            const sentDeletes = this.snapshotUnpersistedDeletes();
             if (!this.snapshotStore) {
                 const kind = contentSizeKind(localUpdate.byteLength, this.maxContentBytes);
                 if (kind === "abort") {
@@ -1111,7 +1125,7 @@ export class FireProvider extends ObservableV2 {
                     remoteBytes.byteLength > EMPTY_YJS_UPDATE_MAX_BYTES &&
                     (!remoteSv ||
                         !stateVectorCovers(Y.encodeStateVector(this.doc), remoteSv))) {
-                    Y.applyUpdate(this.doc, remoteBytes, "origin:firebase/update");
+                    Y.applyUpdate(this.doc, remoteBytes, FIREBASE_UPDATE_ORIGIN);
                 }
                 if (remoteSv) {
                     this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, remoteSv);
@@ -1121,6 +1135,7 @@ export class FireProvider extends ObservableV2 {
             }
             this.hasRemoteContent = true;
             this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, svAtEncode);
+            this.markDeletesPersisted(sentDeletes);
         });
         /** Full-state encode, timed into {@link lastEncodeMs}. */
         this.encodeFullState = () => {
@@ -1138,7 +1153,10 @@ export class FireProvider extends ObservableV2 {
             }
             const encodeStartedAt = Date.now();
             const svAtEncode = Y.encodeStateVector(this.doc);
-            const delta = Y.encodeStateAsUpdate(this.doc, this.lastPersistedSV);
+            const sentDeletes = this.snapshotUnpersistedDeletes();
+            // Only deletions a reader of the persisted updates may lack, not the
+            // doc's whole delete set (DEV-356). A save with nothing new is empty.
+            const delta = encodeDeltaWithDeleteRanges(this.doc, this.lastPersistedSV, sentDeletes);
             this.lastEncodeMs = Date.now() - encodeStartedAt;
             this.reportWork("delta-encode", this.lastEncodeMs, delta);
             if (delta.byteLength <= EMPTY_YJS_UPDATE_MAX_BYTES) {
@@ -1188,6 +1206,7 @@ export class FireProvider extends ObservableV2 {
             if (result === null || result === void 0 ? void 0 : result.id)
                 this.appliedUpdateIds.add(result.id);
             this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, svAtEncode);
+            this.markDeletesPersisted(sentDeletes);
             return true;
         });
         this.scheduleFold = () => {
@@ -1224,6 +1243,7 @@ export class FireProvider extends ObservableV2 {
             // the union cannot fit either: skip it. On a large registry that union
             // took 4-5 s of main thread before failing the same way.
             const localUpdate = this.encodeFullState();
+            const sentDeletes = this.snapshotUnpersistedDeletes();
             if (!this.snapshotStore &&
                 this.doc.gc &&
                 contentSizeKind(localUpdate.byteLength, this.maxContentBytes) === "abort") {
@@ -1253,6 +1273,7 @@ export class FireProvider extends ObservableV2 {
                 if (fold.status !== "ok")
                     return;
                 this.applyFoldSuccess(fold, listed);
+                this.markDeletesPersisted(sentDeletes);
             }
             catch (error) {
                 if (error instanceof EpochMismatchError) {
@@ -1343,6 +1364,25 @@ export class FireProvider extends ObservableV2 {
                     data: update,
                 });
             }
+        };
+        this.trackDeletes = (transaction) => {
+            if (transaction.origin === FIREBASE_UPDATE_ORIGIN)
+                return;
+            if (transaction.deleteSet.clients.size === 0)
+                return;
+            addDeleteRanges(this.unpersistedDeletes, transaction.deleteSet);
+        };
+        /** Copy of {@link unpersistedDeletes}, taken when a write encodes the doc. */
+        this.snapshotUnpersistedDeletes = () => {
+            const copy = new Map();
+            addDeleteRanges(copy, this.unpersistedDeletes);
+            return copy;
+        };
+        /** A write carrying `sent` landed: those deletions are persisted. */
+        this.markDeletesPersisted = (sent) => {
+            if (sent.size === 0)
+                return;
+            this.unpersistedDeletes = subtractDeleteRanges(this.unpersistedDeletes, sent);
         };
         this.updateHandler = (update, origin) => {
             // Origin can be of the following types
@@ -1448,6 +1488,13 @@ export class FireProvider extends ObservableV2 {
         this.persistenceMode = persistence !== null && persistence !== void 0 ? persistence : "indexeddb";
         this.persistenceAdapter = createPersistenceAdapter(this.persistenceMode);
         this.awareness = new awarenessProtocol.Awareness(this.doc);
+        // Deletions already in a doc handed to the provider were never written
+        // by it: treat them as unpersisted. Track every later one from here, so
+        // none is missed before init() attaches the update handler.
+        if (this.doc.store.clients.size > 0) {
+            addDeleteRanges(this.unpersistedDeletes, Y.createDeleteSetFromStructStore(this.doc.store));
+        }
+        this.doc.on("afterTransaction", this.trackDeletes);
         // Initialize the provider
         const init = this.init();
     }

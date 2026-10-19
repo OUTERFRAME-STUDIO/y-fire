@@ -21,3 +21,9 @@ export {
   SnapshotPointerChangedError,
   updateEpochMatches,
 } from "./append-store";
+export {
+  addDeleteRanges,
+  encodeDeltaWithDeleteRanges,
+  subtractDeleteRanges,
+  type DeleteRanges,
+} from "./delete-set";
