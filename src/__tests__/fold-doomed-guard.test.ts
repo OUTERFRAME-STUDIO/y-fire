@@ -70,4 +70,40 @@ describe("DEV-358 doomed fold guard", () => {
 
     expect(foldUpdates).toHaveBeenCalledTimes(1);
   });
+
+  // DEV-137: an UndoManager keeps deleted items so it can restore them, so the
+  // tab's full encode still carries their text. A fresh doc drops it on apply.
+  it("measures the replica without deleted text an UndoManager keeps", async () => {
+    const created = await createTestProvider({
+      foldUpdateThreshold: 2,
+      maxContentBytes: 4096,
+    });
+    provider = created.provider;
+    const onSaveError = vi.fn();
+    provider.onSaveError = onSaveError;
+    emitServerUpdate(TEST_PATH, Y.encodeStateAsUpdate(new Y.Doc()));
+    await flushMicrotasks();
+
+    const text = created.ydoc.getText("t");
+    const undo = new Y.UndoManager(text, { captureTimeout: 0 });
+    for (const label of ["A", "B"]) {
+      text.insert(0, "x".repeat(3000));
+      text.delete(0, 3000);
+      text.insert(0, label);
+      await provider.saveToFirestore();
+    }
+    await whenTabFoldsIdle();
+
+    expect(Y.encodeStateAsUpdate(created.ydoc).byteLength).toBeGreaterThan(
+      4096,
+    );
+    expect(foldUpdates).toHaveBeenCalled();
+    for (const result of vi.mocked(foldUpdates).mock.results) {
+      const fold = await result.value;
+      expect(fold).toMatchObject({ status: "ok" });
+      expect(fold.byteLength).toBeLessThan(1024);
+    }
+    expect(onSaveError).not.toHaveBeenCalled();
+    undo.destroy();
+  });
 });

@@ -16,7 +16,7 @@ import { WebRtc } from "./webrtc";
 import { createGraph } from "./graph";
 import { createPersistenceAdapter, decodeEpochMeta, encodeEpochMeta, persistenceMetaKey, } from "./persistence";
 import { EMPTY_YJS_UPDATE_MAX_BYTES, FIRESTORE_CONTENT_MAX_BYTES, contentSizeKind, } from "./firestore-limits";
-import { appendUpdate, DEFAULT_EPOCH_FIELD, DEFAULT_FOLD_BYTES_FRACTION, DEFAULT_FOLD_UPDATE_THRESHOLD, EpochMismatchError, foldUpdates, isAlreadyExistsError, listUpdates, readBytes, readSnapshotMeta, snapshotMetaFromFields, updateEpochMatches, updateIdFromAlreadyExistsError, updatesCollectionPath, writeSnapshot, stampSnapshotMeta, } from "./append-store";
+import { appendUpdate, DEFAULT_EPOCH_FIELD, DEFAULT_FOLD_BYTES_FRACTION, DEFAULT_FOLD_UPDATE_THRESHOLD, EpochMismatchError, foldUpdates, isAlreadyExistsError, listUpdates, readBytes, readSnapshotMeta, snapshotMetaFromFields, updateEpochMatches, updateIdFromAlreadyExistsError, updatesCollectionPath, writeSnapshot, stampSnapshotMeta, unionYjsBytes, } from "./append-store";
 import { enqueueTabFold } from "./fold-scheduler";
 import { mergeStateVectors, stateVectorCovers, stateVectorFromUpdate } from "./state-vector";
 import { addDeleteRanges, encodeDeltaWithDeleteRanges, subtractDeleteRanges, } from "./delete-set";
@@ -933,7 +933,7 @@ export class FireProvider extends ObservableV2 {
                 try {
                     this.assertCanWriteFirestore();
                     if (!this.hasRemoteContent) {
-                        yield this.writeFirstSnapshot(this.encodeFullState());
+                        yield this.writeFirstSnapshot(this.collectFullState(this.encodeFullState()));
                     }
                     else {
                         // A routine append only needs the delta. The full state is encoded
@@ -1145,6 +1145,25 @@ export class FireProvider extends ObservableV2 {
             this.reportWork("full-encode", this.lastEncodeMs, bytes);
             return bytes;
         };
+        /**
+         * `localUpdate` without the text of deleted items this doc still keeps
+         * (DEV-137). An UndoManager keeps deleted items so it can restore them, so
+         * a long editing session carries every pasted-then-deleted block in the full
+         * encode. A fresh doc garbage-collects them on apply. Only paid when the raw
+         * encode is near the Firestore cap, and never for a snapshotStore shard.
+         */
+        this.collectFullState = (localUpdate) => {
+            if (this.snapshotStore ||
+                contentSizeKind(localUpdate.byteLength, this.maxContentBytes) === "ok") {
+                return localUpdate;
+            }
+            const startedAt = Date.now();
+            const collected = unionYjsBytes([localUpdate]);
+            this.reportWork("collect-encode", Date.now() - startedAt, collected);
+            return collected.byteLength < localUpdate.byteLength
+                ? collected
+                : localUpdate;
+        };
         /** Returns true when the append landed and a fold may be due. */
         this.appendDelta = () => __awaiter(this, void 0, void 0, function* () {
             if (this.updatesAccessDenied) {
@@ -1241,8 +1260,9 @@ export class FireProvider extends ObservableV2 {
             // Encode only once a fold is due (DEV-358). The union below contains
             // every struct of this replica, so on a GC'd doc already over the cap
             // the union cannot fit either: skip it. On a large registry that union
-            // took 4-5 s of main thread before failing the same way.
-            const localUpdate = this.encodeFullState();
+            // took 4-5 s of main thread before failing the same way. Measure it
+            // without deleted text the doc only keeps for undo (DEV-137).
+            const localUpdate = this.collectFullState(this.encodeFullState());
             const sentDeletes = this.snapshotUnpersistedDeletes();
             if (!this.snapshotStore &&
                 this.doc.gc &&

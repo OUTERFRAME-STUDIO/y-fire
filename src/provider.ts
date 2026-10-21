@@ -45,6 +45,7 @@ import {
   updatesCollectionPath,
   writeSnapshot,
   stampSnapshotMeta,
+  unionYjsBytes,
   type ListedUpdate,
   type SnapshotStore,
 } from "./append-store";
@@ -96,6 +97,8 @@ export type MainThreadWorkPhase =
   | "local-encode"
   /** Full-doc encode for a snapshot write or a fold. */
   | "full-encode"
+  /** Re-encode of a near-cap full encode through a fresh doc (DEV-137). */
+  | "collect-encode"
   /** Delta encode for an `updates/*` append. */
   | "delta-encode"
   /** Applying Firestore bytes, including the doc's observers. */
@@ -1150,7 +1153,9 @@ export class FireProvider extends ObservableV2<any> {
       try {
         this.assertCanWriteFirestore();
         if (!this.hasRemoteContent) {
-          await this.writeFirstSnapshot(this.encodeFullState());
+          await this.writeFirstSnapshot(
+            this.collectFullState(this.encodeFullState()),
+          );
         } else {
           // A routine append only needs the delta. The full state is encoded
           // lazily, by the paths that write a snapshot (DEV-358: on a large
@@ -1398,6 +1403,28 @@ export class FireProvider extends ObservableV2<any> {
     return bytes;
   };
 
+  /**
+   * `localUpdate` without the text of deleted items this doc still keeps
+   * (DEV-137). An UndoManager keeps deleted items so it can restore them, so
+   * a long editing session carries every pasted-then-deleted block in the full
+   * encode. A fresh doc garbage-collects them on apply. Only paid when the raw
+   * encode is near the Firestore cap, and never for a snapshotStore shard.
+   */
+  private collectFullState = (localUpdate: Uint8Array): Uint8Array => {
+    if (
+      this.snapshotStore ||
+      contentSizeKind(localUpdate.byteLength, this.maxContentBytes) === "ok"
+    ) {
+      return localUpdate;
+    }
+    const startedAt = Date.now();
+    const collected = unionYjsBytes([localUpdate]);
+    this.reportWork("collect-encode", Date.now() - startedAt, collected);
+    return collected.byteLength < localUpdate.byteLength
+      ? collected
+      : localUpdate;
+  };
+
   /** Returns true when the append landed and a fold may be due. */
   private appendDelta = async (): Promise<boolean> => {
     if (this.updatesAccessDenied) {
@@ -1497,8 +1524,9 @@ export class FireProvider extends ObservableV2<any> {
     // Encode only once a fold is due (DEV-358). The union below contains
     // every struct of this replica, so on a GC'd doc already over the cap
     // the union cannot fit either: skip it. On a large registry that union
-    // took 4-5 s of main thread before failing the same way.
-    const localUpdate = this.encodeFullState();
+    // took 4-5 s of main thread before failing the same way. Measure it
+    // without deleted text the doc only keeps for undo (DEV-137).
+    const localUpdate = this.collectFullState(this.encodeFullState());
     const sentDeletes = this.snapshotUnpersistedDeletes();
     if (
       !this.snapshotStore &&
