@@ -117,7 +117,7 @@ const editor = new Editor({
   contentGzipBytes   number?
   contentRawBytes    number?
 {documentPath}/updates/{autoId}
-  update             Bytes             // Y.encodeStateAsUpdate(doc, lastPersistedSV)
+  update             Bytes             // structs since lastPersistedSV + only unpersisted deletions (DEV-356)
   seq                number            // debug / fold window only
   clientId           string?           // omitted when the WebRTC uid is not yet known
   epoch              number?           // writer epoch; omitted on legacy docs
