@@ -31,6 +31,8 @@ export type MainThreadWorkPhase =
 "local-encode"
 /** Full-doc encode for a snapshot write or a fold. */
  | "full-encode"
+/** Re-encode of a near-cap full encode through a fresh doc (DEV-137). */
+ | "collect-encode"
 /** Delta encode for an `updates/*` append. */
  | "delta-encode"
 /** Applying Firestore bytes, including the doc's observers. */
@@ -298,6 +300,14 @@ export declare class FireProvider extends ObservableV2<any> {
     private writeFirstSnapshot;
     /** Full-state encode, timed into {@link lastEncodeMs}. */
     private encodeFullState;
+    /**
+     * `localUpdate` without the text of deleted items this doc still keeps
+     * (DEV-137). An UndoManager keeps deleted items so it can restore them, so
+     * a long editing session carries every pasted-then-deleted block in the full
+     * encode. A fresh doc garbage-collects them on apply. Only paid when the raw
+     * encode is near the Firestore cap, and never for a snapshotStore shard.
+     */
+    private collectFullState;
     /** Returns true when the append landed and a fold may be due. */
     private appendDelta;
     private scheduleFold;
