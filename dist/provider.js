@@ -7,7 +7,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
         step((generator = generator.apply(thisArg, _arguments || [])).next());
     });
 };
-import { getFirestore, onSnapshot, doc, collection, getDocFromServer, } from "@firebase/firestore";
+import { getFirestore, onSnapshot, doc, collection, getDocFromServer, runTransaction, } from "@firebase/firestore";
 import * as Y from "yjs";
 import { ObservableV2 } from "lib0/observable";
 import * as awarenessProtocol from "y-protocols/awareness";
@@ -573,6 +573,43 @@ export class FireProvider extends ObservableV2 {
                 unsubUpdates();
             };
         };
+        /**
+         * Read the shard doc from the server, bypassing the persistent cache and
+         * the listen target. `getDocFromServer` listens on the same target as
+         * {@link trackData}, so a stale "missing" entry answers it too; a
+         * transaction read goes to the backend directly. The read is kept when
+         * only the commit fails (it verifies the read doc, which a read-only
+         * user may be refused). `null` when nothing was read.
+         */
+        this.readShardDocFromServer = () => __awaiter(this, void 0, void 0, function* () {
+            let read;
+            try {
+                yield runTransaction(this.db, (tx) => __awaiter(this, void 0, void 0, function* () {
+                    const snap = yield tx.get(doc(this.db, this.documentPath));
+                    read = snap.exists()
+                        ? {
+                            exists: true,
+                            data: snap.data(),
+                        }
+                        : { exists: false };
+                }));
+            }
+            catch (error) {
+                this.consoleHandler("Firestore server read error", error);
+            }
+            return read !== null && read !== void 0 ? read : null;
+        });
+        this.reportSnapshotAnomaly = (kind) => {
+            this.consoleHandler("Snapshot anomaly", kind);
+            if (!this.onSnapshotAnomaly)
+                return;
+            try {
+                this.onSnapshotAnomaly({ documentPath: this.documentPath, kind });
+            }
+            catch (e) {
+                this.consoleHandler("onSnapshotAnomaly error", e);
+            }
+        };
         this.handleDocSnapshot = (snap) => __awaiter(this, void 0, void 0, function* () {
             var _c;
             const hydrateGen = ++this.snapshotHydrateGen;
@@ -607,11 +644,40 @@ export class FireProvider extends ObservableV2 {
             else if (!fromCache &&
                 !this.epochReplaced &&
                 this.hydratedEpoch === undefined) {
-                // Server-confirmed absence. Cache-only "missing" must not pin epoch 0
+                // "Missing" from the server. Cache-only "missing" must not pin epoch 0
                 // or a later server snapshot of a real epoch false-triggers replace.
-                this.latestObservedEpoch = 0;
-                this.hydratedEpoch = 0;
-                this.replayObservedUpdates();
+                // A stale cache entry can still report a live doc as missing here
+                // (DEV-421), so confirm with a read that bypasses the listen target.
+                const confirmed = yield this.readShardDocFromServer();
+                if (hydrateGen !== this.snapshotHydrateGen)
+                    return;
+                if (!confirmed) {
+                    this.reportSnapshotAnomaly("missing-verify-failed");
+                    this.scheduleHydrateRetry();
+                    return;
+                }
+                if (confirmed.exists) {
+                    this.reportSnapshotAnomaly("listener-missing-doc-exists");
+                    const meta = readSnapshotMeta(confirmed.data, this.epochField);
+                    this.latestObservedEpoch = meta.epoch;
+                    const applied = yield this.applyRemoteSnapshot(meta, hydrateGen);
+                    if (!applied)
+                        return;
+                    this.hydrateRetryAttempt = 0;
+                    this.hydratedEpoch = meta.epoch;
+                    this.replayObservedUpdates();
+                    if (hydrateGen !== this.snapshotHydrateGen)
+                        return;
+                    if (!this.ready && this.onReady) {
+                        this.onReady();
+                        this.ready = true;
+                    }
+                }
+                else {
+                    this.latestObservedEpoch = 0;
+                    this.hydratedEpoch = 0;
+                    this.replayObservedUpdates();
+                }
             }
             if (hydrateGen !== this.snapshotHydrateGen)
                 return;

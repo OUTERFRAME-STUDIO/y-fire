@@ -5,6 +5,7 @@ export type {
   FireSaveReason,
   FireSavePhase,
   EpochReplaceEvent,
+  SnapshotAnomalyEvent,
   SnapshotMeta,
   SnapshotStore,
   MainThreadWorkEvent,
