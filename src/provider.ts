@@ -7,6 +7,7 @@ import {
   doc,
   collection,
   getDocFromServer,
+  runTransaction,
   type Bytes,
 } from "@firebase/firestore";
 import * as Y from "yjs";
@@ -89,6 +90,18 @@ export interface FireSaveContext {
 export interface EpochReplaceEvent {
   from: number;
   to: number;
+}
+
+/**
+ * The doc listener reported the shard as missing from the server
+ * (`exists() === false`, `fromCache === false`) and a direct server read
+ * disagreed or failed (DEV-421). A stale Firestore cache entry causes it.
+ * - `listener-missing-doc-exists`: the doc exists; hydrated from that read.
+ * - `missing-verify-failed`: the read failed; not server-ready, retrying.
+ */
+export interface SnapshotAnomalyEvent {
+  documentPath: string;
+  kind: "listener-missing-doc-exists" | "missing-verify-failed";
 }
 
 /** Synchronous main-thread work the provider does on a shard. */
@@ -300,6 +313,7 @@ export class FireProvider extends ObservableV2<any> {
   public onSaveError: (error: unknown, ctx: FireSaveContext) => void;
   public onSaveWarning: (ctx: FireSaveContext) => void;
   public onEpochReplace: (event: EpochReplaceEvent) => void;
+  public onSnapshotAnomaly: (event: SnapshotAnomalyEvent) => void;
 
   init = async () => {
     this.trackData(); // initiate this before creating instance, so that users with read permissions can also view the document
@@ -691,6 +705,44 @@ export class FireProvider extends ObservableV2<any> {
     };
   };
 
+  /**
+   * Read the shard doc from the server, bypassing the persistent cache and
+   * the listen target. `getDocFromServer` listens on the same target as
+   * {@link trackData}, so a stale "missing" entry answers it too; a
+   * transaction read goes to the backend directly. The read is kept when
+   * only the commit fails (it verifies the read doc, which a read-only
+   * user may be refused). `null` when nothing was read.
+   */
+  private readShardDocFromServer = async (): Promise<
+    { exists: boolean; data?: Record<string, unknown> } | null
+  > => {
+    let read: { exists: boolean; data?: Record<string, unknown> } | undefined;
+    try {
+      await runTransaction(this.db, async (tx) => {
+        const snap = await tx.get(doc(this.db, this.documentPath));
+        read = snap.exists()
+          ? {
+              exists: true,
+              data: snap.data() as Record<string, unknown> | undefined,
+            }
+          : { exists: false };
+      });
+    } catch (error) {
+      this.consoleHandler("Firestore server read error", error);
+    }
+    return read ?? null;
+  };
+
+  private reportSnapshotAnomaly = (kind: SnapshotAnomalyEvent["kind"]) => {
+    this.consoleHandler("Snapshot anomaly", kind);
+    if (!this.onSnapshotAnomaly) return;
+    try {
+      this.onSnapshotAnomaly({ documentPath: this.documentPath, kind });
+    } catch (e) {
+      this.consoleHandler("onSnapshotAnomaly error", e);
+    }
+  };
+
   private handleDocSnapshot = async (snap: {
     exists: () => boolean;
     data: () => unknown;
@@ -728,11 +780,36 @@ export class FireProvider extends ObservableV2<any> {
       !this.epochReplaced &&
       this.hydratedEpoch === undefined
     ) {
-      // Server-confirmed absence. Cache-only "missing" must not pin epoch 0
+      // "Missing" from the server. Cache-only "missing" must not pin epoch 0
       // or a later server snapshot of a real epoch false-triggers replace.
-      this.latestObservedEpoch = 0;
-      this.hydratedEpoch = 0;
-      this.replayObservedUpdates();
+      // A stale cache entry can still report a live doc as missing here
+      // (DEV-421), so confirm with a read that bypasses the listen target.
+      const confirmed = await this.readShardDocFromServer();
+      if (hydrateGen !== this.snapshotHydrateGen) return;
+      if (!confirmed) {
+        this.reportSnapshotAnomaly("missing-verify-failed");
+        this.scheduleHydrateRetry();
+        return;
+      }
+      if (confirmed.exists) {
+        this.reportSnapshotAnomaly("listener-missing-doc-exists");
+        const meta = readSnapshotMeta(confirmed.data, this.epochField);
+        this.latestObservedEpoch = meta.epoch;
+        const applied = await this.applyRemoteSnapshot(meta, hydrateGen);
+        if (!applied) return;
+        this.hydrateRetryAttempt = 0;
+        this.hydratedEpoch = meta.epoch;
+        this.replayObservedUpdates();
+        if (hydrateGen !== this.snapshotHydrateGen) return;
+        if (!this.ready && this.onReady) {
+          this.onReady();
+          this.ready = true;
+        }
+      } else {
+        this.latestObservedEpoch = 0;
+        this.hydratedEpoch = 0;
+        this.replayObservedUpdates();
+      }
     }
     if (hydrateGen !== this.snapshotHydrateGen) return;
     if (!fromCache) {

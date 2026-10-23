@@ -25,6 +25,17 @@ export interface EpochReplaceEvent {
     from: number;
     to: number;
 }
+/**
+ * The doc listener reported the shard as missing from the server
+ * (`exists() === false`, `fromCache === false`) and a direct server read
+ * disagreed or failed (DEV-421). A stale Firestore cache entry causes it.
+ * - `listener-missing-doc-exists`: the doc exists; hydrated from that read.
+ * - `missing-verify-failed`: the read failed; not server-ready, retrying.
+ */
+export interface SnapshotAnomalyEvent {
+    documentPath: string;
+    kind: "listener-missing-doc-exists" | "missing-verify-failed";
+}
 /** Synchronous main-thread work the provider does on a shard. */
 export type MainThreadWorkPhase = 
 /** Full-doc encode for the IndexedDB copy. */
@@ -206,6 +217,7 @@ export declare class FireProvider extends ObservableV2<any> {
     onSaveError: (error: unknown, ctx: FireSaveContext) => void;
     onSaveWarning: (ctx: FireSaveContext) => void;
     onEpochReplace: (event: EpochReplaceEvent) => void;
+    onSnapshotAnomaly: (event: SnapshotAnomalyEvent) => void;
     init: () => Promise<void>;
     syncLocal: () => Promise<void>;
     saveToLocal: () => Promise<void>;
@@ -250,6 +262,16 @@ export declare class FireProvider extends ObservableV2<any> {
     private replayObservedUpdates;
     private consumeUpdatesSnapshot;
     trackData: () => void;
+    /**
+     * Read the shard doc from the server, bypassing the persistent cache and
+     * the listen target. `getDocFromServer` listens on the same target as
+     * {@link trackData}, so a stale "missing" entry answers it too; a
+     * transaction read goes to the backend directly. The read is kept when
+     * only the commit fails (it verifies the read doc, which a read-only
+     * user may be refused). `null` when nothing was read.
+     */
+    private readShardDocFromServer;
+    private reportSnapshotAnomaly;
     private handleDocSnapshot;
     /**
      * Apply remote snapshot bytes. Returns false when a storage read failed
