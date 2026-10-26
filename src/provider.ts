@@ -124,6 +124,23 @@ export interface MainThreadWorkEvent {
   bytes: number;
 }
 
+/**
+ * Firestore bytes threw while being applied to the doc. Usually a Y observer
+ * of the host (an editor binding) threw after Yjs integrated the bytes
+ * (`integrated: true`): the doc is current, only the observer missed it.
+ * `integrated: false` means the bytes did not apply (malformed update).
+ * The provider keeps going either way and does not resubscribe.
+ */
+export interface RemoteApplyErrorEvent {
+  documentPath: string;
+  /** `update`: an `updates/*` doc; `snapshot`: the snapshot or inline `content`. */
+  source: "update" | "snapshot";
+  /** The `updates/*` doc id when `source` is `update`. */
+  updateId?: string;
+  integrated: boolean;
+  error: unknown;
+}
+
 export interface Parameters {
   firebaseApp: FirebaseApp;
   ydoc: Y.Doc;
@@ -234,6 +251,11 @@ export class FireProvider extends ObservableV2<any> {
   lastEncodeMs: number | null = null;
   lastLocalEncodeMs: number | null = null;
   onMainThreadWork?: (event: MainThreadWorkEvent) => void;
+  /**
+   * Called when Firestore bytes throw while being applied (DEV-455). When
+   * unset the error is logged through `consoleHandler`.
+   */
+  onRemoteApplyError?: (event: RemoteApplyErrorEvent) => void;
   lastSaveDurationMs: number | null = null;
   private saveQueued: boolean = false;
 
@@ -535,15 +557,74 @@ export class FireProvider extends ObservableV2<any> {
     }
   };
 
-  private applyRemoteUpdateBytes = (bytes: Uint8Array) => {
+  private applyRemoteUpdateBytes = (bytes: Uint8Array, updateId: string) => {
     this.firebaseDataLastUpdatedAt = new Date().getTime();
     const applyStartedAt = Date.now();
-    Y.applyUpdate(this.doc, bytes, FIREBASE_UPDATE_ORIGIN);
+    const integrated = this.applyFirestoreBytes(bytes, "update", updateId);
     this.reportWork("remote-apply", Date.now() - applyStartedAt, bytes);
+    if (!integrated) return;
     this.lastPersistedSV = mergeStateVectors(
       this.lastPersistedSV,
       stateVectorFromUpdate(bytes),
     );
+  };
+
+  /**
+   * Apply Firestore bytes. A throw is either a host observer failing after
+   * Yjs integrated the bytes, or bytes Yjs cannot decode. Neither is a
+   * Firestore failure, so report it and return whether the doc now holds
+   * the bytes instead of rethrowing into the listener (DEV-455).
+   */
+  private applyFirestoreBytes = (
+    bytes: Uint8Array,
+    source: RemoteApplyErrorEvent["source"],
+    updateId?: string,
+  ): boolean => {
+    try {
+      Y.applyUpdate(this.doc, bytes, FIREBASE_UPDATE_ORIGIN);
+      return true;
+    } catch (error) {
+      let integrated = false;
+      try {
+        integrated = stateVectorCovers(
+          Y.encodeStateVector(this.doc),
+          stateVectorFromUpdate(bytes),
+        );
+      } catch {
+        // Undecodable bytes: not integrated.
+      }
+      this.reportRemoteApplyError({
+        documentPath: this.documentPath,
+        source,
+        ...(updateId !== undefined ? { updateId } : {}),
+        integrated,
+        error,
+      });
+      return integrated;
+    }
+  };
+
+  /**
+   * Snapshot bytes that did not apply leave the replica without its base:
+   * throw so the doc listener retries with backoff. An observer error after
+   * the bytes integrated is only reported.
+   */
+  private applySnapshotBytes = (bytes: Uint8Array) => {
+    if (!this.applyFirestoreBytes(bytes, "snapshot")) {
+      throw new Error("y-fire: snapshot bytes did not apply");
+    }
+  };
+
+  private reportRemoteApplyError = (event: RemoteApplyErrorEvent) => {
+    if (!this.onRemoteApplyError) {
+      this.consoleHandler("Remote apply error", event.error);
+      return;
+    }
+    try {
+      this.onRemoteApplyError(event);
+    } catch (e) {
+      this.consoleHandler("onRemoteApplyError error", e);
+    }
   };
 
   private enterEpochReplace(to: number) {
@@ -634,7 +715,7 @@ export class FireProvider extends ObservableV2<any> {
         if (typeof data?.seq === "number" && data.seq > this.lastSeq) {
           this.lastSeq = data.seq;
         }
-        this.applyRemoteUpdateBytes(bytes);
+        this.applyRemoteUpdateBytes(bytes, d.id);
       });
     }
     this.listedUpdates = listed;
@@ -654,10 +735,17 @@ export class FireProvider extends ObservableV2<any> {
       doc(this.db, this.documentPath),
       { includeMetadataChanges: true },
       (snap) => {
-        void this.handleDocSnapshot(snap).catch((error) => {
-          this.consoleHandler("Firestore sync error", error);
-          this.scheduleSnapshotRetry();
-        });
+        // Reset the backoff only once a snapshot was handled: a snapshot
+        // that keeps failing must back off, not retry every 500 ms (DEV-455).
+        void this.handleDocSnapshot(snap).then(
+          () => {
+            this.snapshotRetryAttempt = 0;
+          },
+          (error) => {
+            this.consoleHandler("Firestore sync error", error);
+            this.scheduleSnapshotRetry();
+          },
+        );
       },
       (error) => {
         this.consoleHandler("Firestore sync error", error);
@@ -672,11 +760,13 @@ export class FireProvider extends ObservableV2<any> {
       collection(this.db, updatesCollectionPath(this.documentPath)),
       { includeMetadataChanges: true },
       (snap) => {
-        this.snapshotRetryAttempt = 0;
         const fromCache = snap.metadata?.fromCache === true;
         this.updatesAccessDenied = false;
         this.lastUpdatesSnapshot = snap;
         this.consumeUpdatesSnapshot(snap);
+        // Before hydrate, consuming is a no-op: it proves nothing about a
+        // doc snapshot that keeps failing, so it must not reset its backoff.
+        if (this.hydratedEpoch !== undefined) this.snapshotRetryAttempt = 0;
         if (!fromCache) {
           this.updatesServerSnapshot = true;
           this.maybeBecomeServerReady();
@@ -749,7 +839,6 @@ export class FireProvider extends ObservableV2<any> {
     metadata?: { fromCache?: boolean };
   }) => {
     const hydrateGen = ++this.snapshotHydrateGen;
-    this.snapshotRetryAttempt = 0;
     const fromCache = snap.metadata?.fromCache === true;
     this.lastSnapshotFromCache = fromCache;
     if (snap.exists()) {
@@ -885,7 +974,7 @@ export class FireProvider extends ObservableV2<any> {
       this.hasRemoteContent = true;
       this.clearFoldBackoff();
       this.firebaseDataLastUpdatedAt = new Date().getTime();
-      Y.applyUpdate(this.doc, bytes, FIREBASE_UPDATE_ORIGIN);
+      this.applySnapshotBytes(bytes);
       const appliedSv = meta.snapshotSV ?? stateVectorFromUpdate(bytes);
       this.lastPersistedSV = mergeStateVectors(
         this.lastPersistedSV,
@@ -933,7 +1022,7 @@ export class FireProvider extends ObservableV2<any> {
     if (covered) return;
     this.clearFoldBackoff();
     this.firebaseDataLastUpdatedAt = new Date().getTime();
-    Y.applyUpdate(this.doc, content, FIREBASE_UPDATE_ORIGIN);
+    this.applySnapshotBytes(content);
     this.lastPersistedSV = mergeStateVectors(this.lastPersistedSV, contentSV);
   };
 
