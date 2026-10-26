@@ -54,6 +54,22 @@ export interface MainThreadWorkEvent {
     ms: number;
     bytes: number;
 }
+/**
+ * Firestore bytes threw while being applied to the doc. Usually a Y observer
+ * of the host (an editor binding) threw after Yjs integrated the bytes
+ * (`integrated: true`): the doc is current, only the observer missed it.
+ * `integrated: false` means the bytes did not apply (malformed update).
+ * The provider keeps going either way and does not resubscribe.
+ */
+export interface RemoteApplyErrorEvent {
+    documentPath: string;
+    /** `update`: an `updates/*` doc; `snapshot`: the snapshot or inline `content`. */
+    source: "update" | "snapshot";
+    /** The `updates/*` doc id when `source` is `update`. */
+    updateId?: string;
+    integrated: boolean;
+    error: unknown;
+}
 export interface Parameters {
     firebaseApp: FirebaseApp;
     ydoc: Y.Doc;
@@ -151,6 +167,11 @@ export declare class FireProvider extends ObservableV2<any> {
     lastEncodeMs: number | null;
     lastLocalEncodeMs: number | null;
     onMainThreadWork?: (event: MainThreadWorkEvent) => void;
+    /**
+     * Called when Firestore bytes throw while being applied (DEV-455). When
+     * unset the error is logged through `consoleHandler`.
+     */
+    onRemoteApplyError?: (event: RemoteApplyErrorEvent) => void;
     lastSaveDurationMs: number | null;
     private saveQueued;
     firebaseDataLastUpdatedAt: number;
@@ -245,6 +266,20 @@ export declare class FireProvider extends ObservableV2<any> {
     private maybeBecomeServerReady;
     private reportWork;
     private applyRemoteUpdateBytes;
+    /**
+     * Apply Firestore bytes. A throw is either a host observer failing after
+     * Yjs integrated the bytes, or bytes Yjs cannot decode. Neither is a
+     * Firestore failure, so report it and return whether the doc now holds
+     * the bytes instead of rethrowing into the listener (DEV-455).
+     */
+    private applyFirestoreBytes;
+    /**
+     * Snapshot bytes that did not apply leave the replica without its base:
+     * throw so the doc listener retries with backoff. An observer error after
+     * the bytes integrated is only reported.
+     */
+    private applySnapshotBytes;
+    private reportRemoteApplyError;
     private enterEpochReplace;
     /**
      * Server epoch when it is strictly newer than this replica's hydrate.
